@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime
 import tempfile
 import os
+import json
 
 from pdf_parser import parse_contract_pdf
 from google_sheets import append_to_spreadsheet, test_connection
@@ -49,25 +50,24 @@ with st.expander("📖 使い方", expanded=False):
 if 'parsed_data' not in st.session_state:
     st.session_state.parsed_data = []
 
-# サイドバー - Googleスプレッドシート設定
-st.sidebar.markdown("## 🔧 Googleスプレッドシート設定")
-
+# 認証情報の取得（Streamlit Cloud Secrets対応）
 credentials_json = None
-spreadsheet_id = "1poD5gsxCnMrpZrKNd8diJUv_IjgS3K72427Pj-ROqTE"
-sheet_name = "売上台帳"
 
-# JSONファイルの読み込み方法を選択
-json_source = st.sidebar.radio(
-    "認証情報の読み込み方法",
-    ["ファイルから読み込み", "アップロード"],
-    index=0
-)
+# Secretsから認証情報を取得
+try:
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        credentials_json = json.dumps(creds_dict)
+        st.sidebar.success("✅ 認証情報読み込み完了")
+except Exception as e:
+    st.sidebar.warning(f"Secrets読み込みエラー: {e}")
 
-if json_source == "ファイルから読み込み":
+# Secretsがない場合はファイルから読み込み
+if not credentials_json:
+    st.sidebar.markdown("## 🔧 認証設定")
     json_path = st.sidebar.text_input(
         "JSONファイルパス",
-        value="keiyakusho-1e1bbb4afd65.json",
-        help="サービスアカウントのJSONファイルパス（app.pyと同じディレクトリ）"
+        value="keiyakusho-1e1bbb4afd65.json"
     )
     if json_path:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -76,27 +76,18 @@ if json_source == "ファイルから読み込み":
             with open(full_path, 'r') as f:
                 credentials_json = f.read()
             st.sidebar.success("✅ JSONファイル読み込み完了")
-        else:
-            st.sidebar.warning(f"⚠️ ファイルが見つかりません: {json_path}")
-else:
-    credentials_file = st.sidebar.file_uploader(
-        "サービスアカウントJSON",
-        type=['json'],
-        help="Google Cloud Consoleからダウンロードしたサービスアカウントのキーファイル"
-    )
-    if credentials_file:
-        credentials_json = credentials_file.read().decode('utf-8')
+
+# スプレッドシート設定
+st.sidebar.markdown("## 📊 スプレッドシート設定")
 
 spreadsheet_id = st.sidebar.text_input(
     "スプレッドシートID",
-    value="1poD5gsxCnMrpZrKNd8diJUv_IjgS3K72427Pj-ROqTE",
-    help="スプレッドシートURLの /d/ と /edit の間の文字列"
+    value="1poD5gsxCnMrpZrKNd8diJUv_IjgS3K72427Pj-ROqTE"
 )
 
 sheet_name = st.sidebar.text_input(
     "シート名",
-    value="売上台帳",
-    help="データを追加するシート名"
+    value="売上台帳"
 )
 
 # 接続テストボタン
@@ -110,7 +101,7 @@ if st.sidebar.button("🔗 接続テスト"):
         else:
             st.sidebar.error(result['message'])
     else:
-        st.sidebar.warning("認証情報とスプレッドシートIDを入力してください")
+        st.sidebar.warning("認証情報が設定されていません")
 
 # メインエリア
 st.markdown("### 📄 契約書PDFファイル")
@@ -157,11 +148,6 @@ if st.button("🔍 契約書を解析する", type="primary", use_container_widt
 if st.session_state.parsed_data:
     st.markdown("### 📊 解析結果")
     
-    # 表示用カラム
-    display_columns = ['日付', '担当', '顧客名', '初回入金額', '2回目以降入金額', 
-                       '契約開始日', '契約期間', '金額税込み', '金額税抜き', 
-                       '初回入金日', '支払い回数', 'ファイル名']
-    
     display_data = []
     for item in st.session_state.parsed_data:
         row = {
@@ -182,7 +168,6 @@ if st.session_state.parsed_data:
     
     df = pd.DataFrame(display_data)
     
-    # 表示（編集可能）
     edited_df = st.data_editor(
         df,
         use_container_width=True,
@@ -198,13 +183,11 @@ if st.session_state.parsed_data:
     
     st.markdown("---")
     
-    # 出力ボタン
     col_a, col_b = st.columns(2)
     
     with col_a:
         if credentials_json and spreadsheet_id:
             if st.button("🚀 スプレッドシートに送信", type="primary", use_container_width=True):
-                # 編集されたデータを元の形式に変換
                 export_data = []
                 for _, row in edited_df.iterrows():
                     export_data.append({
@@ -235,7 +218,7 @@ if st.session_state.parsed_data:
                 else:
                     st.error(result['message'])
         else:
-            st.warning("サイドバーでGoogleスプレッドシートの設定を完了してください")
+            st.warning("認証情報が設定されていません")
     
     with col_b:
         if st.button("🗑️ 結果をクリア", use_container_width=True):
@@ -246,7 +229,7 @@ if st.session_state.parsed_data:
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #888; font-size: 0.8rem;'>"
-    "さんなび契約書解析ツール v1.1 | SUNLINE合同会社"
+    "さんなび契約書解析ツール v1.2 | SUNLINE合同会社"
     "</div>",
     unsafe_allow_html=True
 )
