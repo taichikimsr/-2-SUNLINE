@@ -49,8 +49,16 @@ def build_upload(
 
     tcols = list(template.columns)
     id_col = _find(tcols, "商品管理番号")
-    kw_col = _find(tcols, "キーワード", exclude=("cpc",)) if level == "keyword" else None
-    cpc_col = _find(tcols, "cpc", exclude=("実績", "平均"))
+    kw_col = None
+    if level == "keyword":
+        kw_col = next((c for c in tcols if normalize_header(c) == "キーワード"), None) or _find(
+            tcols, "キーワード", exclude=("cpc", "一括")
+        )
+    # 書き込む列は「キーワードCPC」「商品CPC」を優先。「目安CPC」「CPC実績」には書き込まない
+    preferred = "キーワードcpc" if level == "keyword" else "商品cpc"
+    cpc_col = next((c for c in tcols if normalize_header(c) == preferred), None) or _find(
+        tcols, "cpc", exclude=("実績", "平均", "目安")
+    )
     missing = [n for n, c in (("商品管理番号", id_col), ("CPC", cpc_col)) if c is None]
     if level == "keyword" and kw_col is None:
         missing.append("キーワード")

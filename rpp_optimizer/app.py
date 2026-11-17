@@ -133,7 +133,7 @@ def show_summary(result: pd.DataFrame):
 
 
 DISPLAY_COLS_ITEM = ["商品管理番号", "商品名", "クリック数", "実績額", "売上金額", "売上件数", "ROAS(%)", "見込みROAS(%)",
-                     "CVR(%)", "目標ROAS(%)", "基準CPC", "基準CPCの出所", "理論上限CPC", "推奨CPC", "変更額",
+                     "CVR(%)", "目標ROAS(%)", "目安CPC", "基準CPC", "基準CPCの出所", "理論上限CPC", "推奨CPC", "変更額",
                      "判定", "理由"]
 DISPLAY_COLS_KW = DISPLAY_COLS_ITEM[:1] + ["キーワード"] + DISPLAY_COLS_ITEM[1:]
 
@@ -162,9 +162,13 @@ def result_editor(result: pd.DataFrame, level: str, key: str) -> pd.DataFrame:
     return merged
 
 
-def download_buttons(result: pd.DataFrame, level: str, template_file, key: str):
+def download_buttons(result: pd.DataFrame, level: str, template_file, key: str, report_df=None):
     label = "キーワード" if level == "keyword" else "商品"
     template = load(template_file) if template_file is not None else None
+    if template is None and report_df is not None:
+        # RMSのRPPレポートは説明行を消せばそのまま一括設定に使える形式のため、レポート自体をテンプレートにする
+        template = report_df
+        st.caption("テンプレート未指定のため、読み込んだレポートと同じ列構成で出力します（先頭の説明行は除外済み）。")
     try:
         upload = build_upload(result, level, template, only_changed, include_review)
     except ValueError as e:
@@ -223,15 +227,19 @@ idf = load(item_file)
 if idf is not None:
     with st.expander("列の対応（自動判定・変更可）", expanded=False):
         cmap = column_selector(idf, ["item_id", "item_name", "clicks", "spend", "sales", "orders",
-                                     "current_cpc", "actual_cpc"], "item")
-    try:
-        rep = attach_master(normalize_report(idf, cmap, "item"), master)
-        item_result = recommend(rep, settings, "item")
-        show_summary(item_result)
-        item_result = result_editor(item_result, "item", "item")
-        download_buttons(item_result, "item", item_template, "item")
-    except ValueError as e:
-        st.error(str(e))
+                                     "current_cpc", "guide_cpc", "actual_cpc"], "item")
+    if detect_columns(idf.columns).get("keyword") == "キーワード":
+        st.error("このファイルは「キーワード別」レポートのため、②では計算しません。"
+                 "下の③に読み込んでください。②には集計単位「商品別」のレポートを読み込みます。")
+    else:
+        try:
+            rep = attach_master(normalize_report(idf, cmap, "item"), master)
+            item_result = recommend(rep, settings, "item")
+            show_summary(item_result)
+            item_result = result_editor(item_result, "item", "item")
+            download_buttons(item_result, "item", item_template, "item", idf)
+        except ValueError as e:
+            st.error(str(e))
 
 # ---------------- キーワード別 ----------------
 st.subheader("③ キーワードCPC")
@@ -243,7 +251,7 @@ kdf = load(kw_file)
 if kdf is not None:
     with st.expander("列の対応（自動判定・変更可）", expanded=False):
         kmap = column_selector(kdf, ["item_id", "keyword", "item_name", "clicks", "spend", "sales", "orders",
-                                     "current_cpc", "actual_cpc"], "kw")
+                                     "current_cpc", "guide_cpc", "actual_cpc"], "kw")
     try:
         rep = attach_master(normalize_report(kdf, kmap, "keyword"), master)
         if item_result is not None:
@@ -254,7 +262,7 @@ if kdf is not None:
         kw_result = recommend(rep, settings, "keyword", prior_vpc=prior)
         show_summary(kw_result)
         kw_result = result_editor(kw_result, "keyword", "kw")
-        download_buttons(kw_result, "keyword", kw_template, "kw")
+        download_buttons(kw_result, "keyword", kw_template, "kw", kdf)
     except ValueError as e:
         st.error(str(e))
 

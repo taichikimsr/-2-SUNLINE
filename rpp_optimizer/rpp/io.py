@@ -28,6 +28,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "spend": ["実績額", "広告費", "消化金額", "利用金額"],
     "actual_cpc": ["cpc実績", "平均cpc", "実績cpc"],
     "current_cpc": ["設定cpc", "入札cpc", "入札単価", "キーワードcpc", "商品cpc", "cpc"],
+    "guide_cpc": ["目安cpc"],
     "sales": ["売上金額"],
     "orders": ["売上件数"],
     "price": ["販売価格", "価格"],
@@ -44,6 +45,7 @@ FIELD_LABELS: Dict[str, str] = {
     "spend": "実績額（広告費）",
     "actual_cpc": "CPC実績",
     "current_cpc": "現在の設定CPC",
+    "guide_cpc": "目安CPC（楽天）",
     "sales": "売上金額",
     "orders": "売上件数",
     "price": "販売価格",
@@ -132,10 +134,13 @@ def detect_column(columns: Iterable[str], field: str, prefer: Optional[str] = No
     norm = {c: normalize_header(c) for c in cols}
     for alias in COLUMN_ALIASES.get(field, []):
         a = normalize_header(alias)
+        exact = [c for c in cols if norm[c] == a]
+        if exact:
+            return exact[0]
         hits = [c for c in cols if a in norm[c]]
         if field == "current_cpc":
-            # 「CPC実績」「平均CPC」は設定CPCではないので除外
-            hits = [c for c in hits if not any(x in norm[c] for x in ("実績", "平均"))]
+            # 「CPC実績」「平均CPC」「目安CPC」は設定CPCではないので除外
+            hits = [c for c in hits if not any(x in norm[c] for x in ("実績", "平均", "目安"))]
         if field == "clicks":
             hits = [c for c in hits if "率" not in norm[c]]
         if not hits:

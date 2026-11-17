@@ -171,3 +171,44 @@ def test_read_rms_style_preamble():
 def test_read_duplicate_headers():
     df = read_csv_bytes("商品管理番号,CPC,CPC\na,1,2\n".encode("utf-8"))
     assert list(df.columns) == ["商品管理番号", "CPC", "CPC_1"]
+
+
+RMS_KW_HEADER = (
+    '"コントロールカラム","日付","商品ページURL","商品管理番号","商品名","キーワード","一括キーワード運用機能",'
+    '"CTR(%)","目安CPC","キーワードCPC","クリック数(合計)","実績額(合計)","CPC実績(合計)",'
+    '"売上金額(合計12時間)","売上件数(合計12時間)","売上金額(合計720時間)","売上件数(合計720時間)",'
+    '"売上金額(新規720時間)","売上件数(新規720時間)"'
+)
+
+
+def _rms_kw_csv():
+    lines = [
+        '"実行日時: 2026-11-17 16:38:07"', "", '"検索条件"', '"集計単位: キーワード別"',
+        '"■■■■■ 商品・キーワードCPCを設定される際にはここから上は行ごと削除してください ■■■■■"',
+        RMS_KW_HEADER,
+        '"","期間","https://example.com/a/","a-1","商品A","kw1","-","5.0","40","","100","8000","80",'
+        '"1000","1","2000","1","0","0"',
+        '"","期間","https://example.com/a/","a-1","商品A","kw2","-","5.0","40","50","5","250","50",'
+        '"0","0","0","0","0","0"',
+    ]
+    return ("\r\n".join(lines) + "\r\n").encode("cp932")
+
+
+def test_rms_keyword_report_format():
+    df = read_csv_bytes(_rms_kw_csv())
+    assert df.columns[0] == "コントロールカラム" and len(df) == 2
+    det = detect_columns(df.columns, prefer_window="720")
+    assert det["keyword"] == "キーワード"
+    assert det["current_cpc"] == "キーワードCPC"
+    assert det["guide_cpc"] == "目安CPC"
+    assert det["sales"] == "売上金額(合計720時間)"
+    rep = normalize_report(df, ColumnMap.from_dict(det), "keyword")
+    r = recommend(attach_master(rep, None), Settings(), "keyword").set_index("キーワード")
+    assert r.loc["kw1", "基準CPCの出所"] == "CPC実績"  # キーワードCPC未設定
+    assert r.loc["kw2", "基準CPCの出所"] == "設定CPC"
+    # レポート自体をテンプレートにして出力 → 「キーワードCPC」列に書き込み、「目安CPC」は変更しない
+    up = build_upload(r.reset_index(), "keyword", df)
+    assert list(up.columns) == list(df.columns)
+    row = up.set_index("キーワード").loc["kw1"]
+    assert row["キーワードCPC"] == r.loc["kw1", "推奨CPC"]
+    assert row["目安CPC"] == "40"

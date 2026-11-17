@@ -54,6 +54,7 @@ class ColumnMap:
     spend: Optional[str] = None
     actual_cpc: Optional[str] = None
     current_cpc: Optional[str] = None
+    guide_cpc: Optional[str] = None
     sales: Optional[str] = None
     orders: Optional[str] = None
 
@@ -91,6 +92,7 @@ def normalize_report(df: pd.DataFrame, cmap: ColumnMap, level: str) -> pd.DataFr
     out["売上件数"] = _num(df, cmap.orders).fillna(0)
     out["現在CPC"] = _num(df, cmap.current_cpc)
     out["CPC実績"] = _num(df, cmap.actual_cpc)
+    out["目安CPC"] = _num(df, cmap.guide_cpc)
 
     # 合計行・空行を除外
     bad_ids = {"", "nan", "合計", "総計", "全体"}
@@ -107,6 +109,7 @@ def normalize_report(df: pd.DataFrame, cmap: ColumnMap, level: str) -> pd.DataFr
         売上金額=("売上金額", "sum"),
         売上件数=("売上件数", "sum"),
         現在CPC=("現在CPC", "last"),
+        目安CPC=("目安CPC", "last"),
     )
     # CPC実績は合算後に再計算（日別行の単純平均は不正確なため）
     agg["CPC実績"] = agg.apply(
