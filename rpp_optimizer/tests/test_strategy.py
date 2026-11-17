@@ -208,3 +208,23 @@ def test_budget_allocation_and_suitability():
     from rpp.export import exclusion_upload_from_actions
     up = exclusion_upload_from_actions(small.actions)
     assert list(up.columns) == ["コントロールカラム", "商品管理番号"] and (up["コントロールカラム"] == "n").all()
+
+
+def test_settings_and_pipeline(tmp_path):
+    from rpp import settings as st
+    from rpp.pipeline import run_once
+    path = tmp_path / "settings.json"
+    st.save({"monthly_budget": 12345, "default_margin": 35, "unknown": 1}, str(path))
+    conf = st.load(str(path))
+    assert conf["monthly_budget"] == 12345 and conf["default_margin"] == 35 and "unknown" not in conf
+    assert st.to_strategy(conf).monthly_budget == 12345
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    for n in ("rms_keyword_report_sample.csv", "rms_item_report_sample.csv", "search_keywords_sample.csv"):
+        (inbox / n).write_bytes(open(os.path.join(S, n), "rb").read())
+    res = run_once(str(inbox), str(tmp_path / "out"), conf, history_dir=str(tmp_path / "out"))
+    assert res["概要"]["月予算"] == 12345
+    assert any("keyword_upload" in k for k in res["出力"])
+    # 2回目は前回の運用記録を自動で読み込む
+    res2 = run_once(str(inbox), str(tmp_path / "out2"), conf, history_dir=str(tmp_path / "out"))
+    assert any(f["種類"] == "history" for f in res2["入力ファイル"])

@@ -1,2 +1,8 @@
 __pycache__/
 .pytest_cache/
+# このPCだけのファイル（ログイン状態・設定・実行結果・操作記録）
+settings.json
+settings.json.tmp
+.rms_profile/
+runs/
+rms_recorded_steps.py

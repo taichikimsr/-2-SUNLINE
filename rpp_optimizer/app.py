@@ -47,43 +47,56 @@ st.markdown(
 st.title("📈 楽天RPP 自動運用")
 st.caption("RMSのレポートを入れるだけで、診断 → 入札・キーワードの追加/削除 → RMS一括アップロード用CSV までを自動で作成します。")
 
-# ================================================================ サイドバー：運用方針
+# ================================================================ サイドバー：運用方針（settings.json に保存）
+from rpp import settings as settings_store  # noqa: E402
+
+conf = settings_store.load()
+modes = list(MODES)
 sb = st.sidebar
+sb.header("月の広告予算")
+budget = sb.number_input("月予算（円）", 0, 100_000_000, int(conf["monthly_budget"] or 0), 5_000,
+                         help="優先度の高い配信から順に予算を割り当て、予算の付かない商品・広告に適さない商品はRPPの除外商品にします。"
+                              "0にすると予算配分と除外は行いません。RMSのキャンペーン設定の「月予算」も同じ金額にしてください。")
+sb.caption(f"1日あたり約 {budget / 30:,.0f}円" if budget else "0円：予算配分と除外をしない")
+
 sb.header("運用方針")
-margin = sb.number_input("粗利率（%）", 1.0, 95.0, 30.0, 1.0,
+margin = sb.number_input("粗利率（%）", 1.0, 95.0, float(conf["default_margin"]), 1.0,
                          help="販売価格から原価・送料・手数料を引いた利益の割合。目標ROASの基準になる最重要の設定です。"
                               "商品ごとに違う場合は商品マスタCSVで指定できます。")
-mode = sb.radio("運用モード", list(MODES), index=1, horizontal=True,
+mode = sb.radio("運用モード", modes, index=modes.index(conf["mode"]) if conf["mode"] in modes else 1, horizontal=True,
                 help="利益重視: 目標ROAS＝損益分岐×1.3／バランス: ×1.1／売上拡大: ×0.9（新規キーワードも積極的に追加）")
 be = 100 / (margin / 100)
 sb.caption(f"損益分岐ROAS {be:.0f}% → 目標ROAS **{be * MODES[mode]['mult']:.0f}%**")
-existing_w = sb.slider("既存顧客の売上の評価", 0.0, 1.0, 1.0, 0.1,
+existing_w = sb.slider("既存顧客の売上の評価", 0.0, 1.0, float(conf["existing_weight"]), 0.1,
                        help="既存顧客は広告が無くても購入した可能性があります。0.5にすると既存顧客の売上を半分として評価し、"
                             "新規顧客の獲得に強い入札になります（レポートに新規/既存の列がある場合のみ有効）。")
-budget = sb.number_input("月の広告予算（円）", 0, 100_000_000, 30_000, 5_000,
-                         help="優先度の高い配信から順に予算を割り当て、予算の付かない商品・広告に適さない商品はRPPの除外商品にします。"
-                              "0にすると予算配分と除外は行いません。RMSのキャンペーン設定の「月予算」も同じ金額にしてください。")
-event = sb.toggle("セール期間（スーパーSALE・お買い物マラソン等）", value=False,
+event = sb.toggle("セール期間（スーパーSALE・お買い物マラソン等）", value=float(conf["event_boost"] or 0) > 0,
                   help="セール中は転換率が上がるため、成果の出ているキーワードの入札を上乗せします。終了後の運用で通常値に戻ります。")
-event_boost = sb.slider("セール時の上乗せ（%）", 5, 50, 20, 5, disabled=not event) / 100 if event else 0.0
+event_boost = sb.slider("セール時の上乗せ（%）", 5, 50, int(round((conf["event_boost"] or 0.2) * 100)), 5,
+                        disabled=not event) / 100 if event else 0.0
 
 with sb.expander("詳細設定"):
-    window = st.radio("売上の計測期間", ["720", "12"], index=0, horizontal=True, format_func=lambda x: f"{x}時間")
-    min_kw = st.number_input("キーワードCPCの下限（円）", 1, 1000, 40)
-    min_item = st.number_input("商品CPCの下限（円）", 1, 1000, 20)
-    max_cpc = st.number_input("CPCの上限（円）", 10, 5000, 300, 10)
-    change = st.slider("1回の最大変更幅（%）", 5, 50, 25, 5) / 100
-    min_clicks = st.number_input("判定に必要なクリック数", 5, 500, 30, 5)
-    kw_cap = st.number_input("1商品あたりのキーワード上限", 1, 50, 20,
+    windows = ["720", "12"]
+    window = st.radio("売上の計測期間", windows, index=windows.index(str(conf["window"])) if str(conf["window"]) in windows else 0,
+                      horizontal=True, format_func=lambda x: f"{x}時間")
+    min_kw = st.number_input("キーワードCPCの下限（円）", 1, 1000, int(conf["min_kw_cpc"]))
+    min_item = st.number_input("商品CPCの下限（円）", 1, 1000, int(conf["min_item_cpc"]))
+    max_cpc = st.number_input("CPCの上限（円）", 10, 5000, int(conf["max_cpc"]), 10)
+    change = st.slider("1回の最大変更幅（%）", 5, 50, int(round(conf["max_change_rate"] * 100)), 5) / 100
+    min_clicks = st.number_input("判定に必要なクリック数", 5, 500, int(conf["min_clicks"]), 5)
+    kw_cap = st.number_input("1商品あたりのキーワード上限", 1, 50, int(conf["max_kw_per_item"]),
                              help="2026年夏に10件→20件へ拡大されたとの情報があります。RMSで確認してください。")
-    new_per = st.number_input("1回で追加する新規キーワード（1商品あたり）", 0, 20, MODES[mode]["new_kw_per_item"])
-    new_max = st.number_input("新規キーワードのテストCPC上限（円）", 40, 1000, 80, 5)
-    assumed_cvr = st.number_input("想定CVR（%）※RPP実績の無い商品の推定に使用", 0.1, 30.0, 1.0, 0.1,
+    new_per = st.number_input("1回で追加する新規キーワード（1商品あたり）", 0, 20,
+                              int(conf["new_kw_per_item"]) if conf["new_kw_per_item"] is not None
+                              else MODES[mode]["new_kw_per_item"])
+    new_max = st.number_input("新規キーワードのテストCPC上限（円）", 40, 1000, int(conf["new_kw_max_cpc"]), 5)
+    assumed_cvr = st.number_input("想定CVR（%）※RPP実績の無い商品の推定に使用", 0.1, 30.0, float(conf["assumed_cvr"]), 0.1,
                                   help="店舗のRPP実績のCVRと混ぜて使います。実績が増えるほど実績の値に近づきます。")
-    del_ratio = st.slider("削除の基準（粗利1件分 × 倍率）", 0.5, 3.0, 1.0, 0.1,
+    del_ratio = st.slider("削除の基準（粗利1件分 × 倍率）", 0.5, 3.0, float(conf["delete_ratio"]), 0.1,
                           help="受注0件のまま、この金額以上を使ったキーワードを削除します。")
-    out_enc = st.radio("CSVの文字コード", ["cp932", "utf-8-sig"], horizontal=True,
-                       format_func=lambda x: "Shift_JIS（RMS用）" if x == "cp932" else "UTF-8")
+    encs = ["cp932", "utf-8-sig"]
+    out_enc = st.radio("CSVの文字コード", encs, index=encs.index(conf["out_encoding"]) if conf["out_encoding"] in encs else 0,
+                       horizontal=True, format_func=lambda x: "Shift_JIS（RMS用）" if x == "cp932" else "UTF-8")
 
 strategy = Strategy(
     default_margin=margin, mode=mode, existing_weight=existing_w, event_boost=event_boost,
@@ -92,6 +105,14 @@ strategy = Strategy(
     new_kw_max_cpc=int(new_max), delete_ratio=del_ratio, assumed_cvr=float(assumed_cvr),
     monthly_budget=float(budget),
 )
+current = {**strategy.__dict__, "window": window, "out_encoding": out_enc}
+saved = {k: conf.get(k) for k in current}
+if sb.button("💾 この設定を保存", use_container_width=True,
+             help="次回の起動時と、自動運用（rms_bot.py）でもこの設定を使います。"):
+    settings_store.save(current)
+    sb.success("保存しました")
+elif any(current[k] != saved[k] for k in current):
+    sb.caption("⚠️ 未保存の変更があります（自動運用には保存した設定が使われます）")
 
 # ================================================================ データ投入
 st.subheader("1. データを入れる")
