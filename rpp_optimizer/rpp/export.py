@@ -86,8 +86,8 @@ def build_upload(
             if kw_col:
                 row[kw_col] = r["キーワード"]
         if ctrl_col:
-            # 既にCPCが設定されていれば u（変更）、未設定なら n（新規登録）。d（削除）は出力しない
-            row[ctrl_col] = "u" if str(row.get(cpc_col, "")).strip() not in ("", "-", "nan") else "n"
+            # RMSのサンプルCSVでは n（登録）と d（削除）のみが使われているため n を入れる。d は出力しない
+            row[ctrl_col] = "n"
         row[cpc_col] = int(r["推奨CPC"])
         rows.append(row)
     out = pd.DataFrame(rows, columns=tcols)

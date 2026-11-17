@@ -211,5 +211,12 @@ def test_rms_keyword_report_format():
     assert list(up.columns) == ["コントロールカラム", "商品管理番号", "キーワード", "キーワードCPC"]
     up = up.set_index("キーワード")
     assert up.loc["kw1", "キーワードCPC"] == r.loc["kw1", "推奨CPC"]
-    assert up.loc["kw1", "コントロールカラム"] == "n"  # キーワードCPC未設定 → 新規登録
-    assert up.loc["kw2", "コントロールカラム"] == "u"  # 設定済み → 変更
+    assert (up["コントロールカラム"] == "n").all()
+
+
+def test_upload_bytes_match_rms_sample_format():
+    # RMSのサンプル: Shift_JIS・LF改行・引用符なし
+    up = pd.DataFrame({"コントロールカラム": ["n"], "商品管理番号": ["4570164011281"],
+                       "キーワード": ["スパイダーマン フィギュア"], "キーワードCPC": [65]})
+    b = to_csv_bytes(up, "cp932", lineterminator="\n")
+    assert b == "コントロールカラム,商品管理番号,キーワード,キーワードCPC\nn,4570164011281,スパイダーマン フィギュア,65\n".encode("cp932")

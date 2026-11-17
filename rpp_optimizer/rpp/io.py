@@ -172,9 +172,13 @@ def to_number(series: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 
-def to_csv_bytes(df: pd.DataFrame, encoding: str = "cp932") -> bytes:
-    """CSVをバイト列で出力。cp932で表せない文字があればエラー内容を分かりやすく返す。"""
-    text = df.to_csv(index=False, lineterminator="\r\n")
+def to_csv_bytes(df: pd.DataFrame, encoding: str = "cp932", lineterminator: str = "\r\n") -> bytes:
+    """CSVをバイト列で出力。cp932で表せない文字があればエラー内容を分かりやすく返す。
+
+    RMSのRPP一括アップロード用サンプルCSVは Shift_JIS・改行LF・引用符なしのため、
+    アップロード用は lineterminator="\n" で出力する。
+    """
+    text = df.to_csv(index=False, lineterminator=lineterminator)
     try:
         return text.encode(encoding)
     except UnicodeEncodeError as e:

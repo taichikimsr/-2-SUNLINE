@@ -183,15 +183,14 @@ def download_buttons(result: pd.DataFrame, level: str, template_file, key: str, 
         if cpc_col and len(upload) and (to_number(upload[cpc_col[0]]) < min_cpc).any():
             st.warning(f"下限CPC（{min_cpc}円）未満の値があります。")
         try:
-            data = to_csv_bytes(upload, out_encoding)
+            data = to_csv_bytes(upload, out_encoding, lineterminator="\n")
             st.download_button(f"⬇️ {label}CPC 一括アップロード用CSV", data,
                                file_name=f"rpp_{level}_cpc_upload_{stamp}.csv", mime="text/csv",
                                key=f"{key}_dl_up", use_container_width=True)
         except ValueError as e:
             st.error(str(e))
         if "コントロールカラム" in upload.columns:
-            st.caption("コントロールカラム: CPC設定済みの行は u（変更）、未設定の行は n（新規登録）を自動で入れています。"
-                       "d（削除）は出力しません。")
+            st.caption("コントロールカラムには、RMSのサンプルCSVと同じ n（登録）を入れています。d（削除）は出力しません。")
         st.caption("⚠️ このCSVをExcelで開いて上書き保存しないでください。商品管理番号（13桁の数字など）が"
                    "「4.57E+12」のような形に変わり、正しく登録できなくなります。")
         st.dataframe(upload.head(50), use_container_width=True, hide_index=True)
