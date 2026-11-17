@@ -133,3 +133,9 @@ def item_upload_from_actions(actions: pd.DataFrame, report_columns=None) -> pd.D
         [[r["コントロール"], r["商品管理番号"], int(r["変更後CPC"])] for _, r in a.iterrows()],
         columns=[ctrl, id_col, cpc],
     )
+
+
+def exclusion_upload_from_actions(actions: pd.DataFrame) -> pd.DataFrame:
+    """RPP除外商品の一括登録用データ。※RMSのサンプルCSVで列構成を未確認（解説記事では n:登録 / d:削除）。"""
+    a = actions[(actions["実行"]) & (actions["施策"] == "除外候補")]
+    return pd.DataFrame([["n", r["商品管理番号"]] for _, r in a.iterrows()], columns=["コントロールカラム", "商品管理番号"])

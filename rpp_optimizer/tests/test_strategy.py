@@ -178,3 +178,33 @@ def test_keyword_quality_rules():
                                               df, 3, extra_anchors={"資生堂"})]
     assert not any("特別価格" in k or "81146" in k or "9歳" in k for k in kws)
     assert "乾燥肌 化粧水" in kws
+
+
+def test_budget_allocation_and_suitability():
+    cat = _catalog()
+    item = _read("rms_item_report_sample.csv")
+    kwr = _read("rms_keyword_report_sample.csv")
+    args = (prepare_report(item, "item"), prepare_report(kwr, "keyword"))
+    big = build_plan(*args, Strategy(default_margin=40, monthly_budget=1_000_000), catalog=cat, period_days=30)
+    small = build_plan(*args, Strategy(default_margin=40, monthly_budget=3_000), catalog=cat, period_days=30)
+    # 適性スコアと判定
+    pf = big.portfolio.set_index("商品管理番号")
+    assert pf.loc["new-01", "適性判定"] == "適さない"  # 500円の商品
+    assert 0 <= pf["広告適性"].min() and pf["広告適性"].max() <= 100
+    # 予算内に収まる
+    for p in (big, small):
+        funded = p.budget.loc[p.budget["予算"] == "配分"]
+        win = funded[funded["優先"] == 1]["月の見込み費用"].sum()
+        assert funded["月の見込み費用"].sum() <= max(p.summary["月予算"] * 0.9, win) + 1
+    # 予算が少ないほど除外が増え、新規キーワードの実行が減る
+    assert small.summary["除外する商品数"] >= big.summary["除外する商品数"]
+    def n_new(p):
+        a = p.actions
+        return int(((a["施策"] == KW_NEW) & a["実行"]).sum())
+    assert n_new(small) <= n_new(big)
+    # 広告に適さない商品は除外
+    ex = set(small.actions.loc[(small.actions["施策"] == "除外候補") & small.actions["実行"], "商品管理番号"])
+    assert "new-01" in ex
+    from rpp.export import exclusion_upload_from_actions
+    up = exclusion_upload_from_actions(small.actions)
+    assert list(up.columns) == ["コントロールカラム", "商品管理番号"] and (up["コントロールカラム"] == "n").all()

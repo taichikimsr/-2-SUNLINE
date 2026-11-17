@@ -20,7 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpp.datasets import (  # noqa: E402
     LABELS, detect_kind, first_or_none, prepare_catalog, prepare_master, prepare_report, prepare_search_keywords,
 )
-from rpp.export import item_upload_from_actions, keyword_upload_from_actions  # noqa: E402
+from rpp.export import (  # noqa: E402
+    exclusion_upload_from_actions, item_upload_from_actions, keyword_upload_from_actions,
+)
 from rpp.io import read_csv_bytes, report_period_days, to_csv_bytes  # noqa: E402
 from rpp.strategy import (  # noqa: E402
     CLS_DATA, CLS_GROW, CLS_KEEP, CLS_NEW, CLS_STRUCT, CLS_TUNE, INV_ATTACK, INV_DEFEND, INV_STOP, INV_TEST,
@@ -58,6 +60,9 @@ sb.caption(f"損益分岐ROAS {be:.0f}% → 目標ROAS **{be * MODES[mode]['mult
 existing_w = sb.slider("既存顧客の売上の評価", 0.0, 1.0, 1.0, 0.1,
                        help="既存顧客は広告が無くても購入した可能性があります。0.5にすると既存顧客の売上を半分として評価し、"
                             "新規顧客の獲得に強い入札になります（レポートに新規/既存の列がある場合のみ有効）。")
+budget = sb.number_input("月の広告予算（円）", 0, 100_000_000, 30_000, 5_000,
+                         help="優先度の高い配信から順に予算を割り当て、予算の付かない商品・広告に適さない商品はRPPの除外商品にします。"
+                              "0にすると予算配分と除外は行いません。RMSのキャンペーン設定の「月予算」も同じ金額にしてください。")
 event = sb.toggle("セール期間（スーパーSALE・お買い物マラソン等）", value=False,
                   help="セール中は転換率が上がるため、成果の出ているキーワードの入札を上乗せします。終了後の運用で通常値に戻ります。")
 event_boost = sb.slider("セール時の上乗せ（%）", 5, 50, 20, 5, disabled=not event) / 100 if event else 0.0
@@ -85,6 +90,7 @@ strategy = Strategy(
     min_item_cpc=int(min_item), min_kw_cpc=int(min_kw), max_cpc=int(max_cpc), max_change_rate=change,
     min_clicks=int(min_clicks), max_kw_per_item=int(kw_cap), new_kw_per_item=int(new_per),
     new_kw_max_cpc=int(new_max), delete_ratio=del_ratio, assumed_cvr=float(assumed_cvr),
+    monthly_budget=float(budget),
 )
 
 # ================================================================ データ投入
@@ -167,8 +173,8 @@ except ValueError as e:
 
 # ================================================================ 結果
 st.subheader("2. 診断とアクションプラン")
-tab_sum, tab_all, tab_items, tab_plan, tab_cand, tab_fb, tab_out = st.tabs(
-    ["概要", "全商品の設計", "商品診断", "アクションプラン", "キーワード設計", "効果検証", "出力"]
+tab_sum, tab_all, tab_budget, tab_items, tab_plan, tab_cand, tab_fb, tab_out = st.tabs(
+    ["概要", "広告適性", "予算配分", "商品診断", "アクションプラン", "キーワード設計", "効果検証", "出力"]
 )
 
 
@@ -185,6 +191,11 @@ with tab_sum:
     kpi(c[2], "ROAS", "-" if pd.isna(s["ROAS(%)"]) else f"{s['ROAS(%)']:,.0f}%")
     kpi(c[3], "粗利 − 広告費", f"{s['粗利-広告費']:,.0f}円")
     kpi(c[4], "実行するアクション", f"{int(s['アクション数'])}件")
+    if s.get("月予算"):
+        c3 = st.columns(3)
+        kpi(c3[0], "月の広告予算", f"{s['月予算']:,.0f}円")
+        kpi(c3[1], "配分した見込み費用", f"{s['配分した見込み費用']:,.0f}円")
+        kpi(c3[2], "除外する商品", f"{int(s['除外する商品数'])}商品")
     if s.get("全商品数"):
         c2 = st.columns(4)
         kpi(c2[0], INV_ATTACK, f"{int(s[INV_ATTACK])}商品")
@@ -232,16 +243,48 @@ with tab_sum:
 
 with tab_all:
     if plan.portfolio.empty:
-        st.info("商品一覧を入れると、RPPの実績が無い商品も含めて全商品の投資区分とキーワードを設計します。")
+        st.info("商品一覧を入れると、RPPの実績が無い商品も含めて全商品の広告適性と投資区分を判定します。")
     else:
-        st.caption("全商品を「1クリックあたりの売上（実績、または 価格×想定CVR）÷ 目標ROAS ＝ 採算CPC」で並べ、"
-                   "キーワードに投資する商品・実績づくりから始める商品・商品CPCだけにする商品・停止を検討する商品に分けています。")
+        st.markdown(
+            "**広告適性（100点満点）** ＝ 採算性40点（損益分岐CPCがキーワード下限に届くか）＋ 価格15点 ＋ "
+            "需要25点（ブランド・作品名／検索流入／受注実績）＋ 季節±10点 ＋ RPP実績での加点・減点"
+            "　→ **60点以上: 適している／40〜59点: テストで見極め／40点未満: 適さない**")
+        vc = plan.portfolio["適性判定"].value_counts()
+        cc = st.columns(3)
+        for col, k in zip(cc, ["適している", "テストで見極め", "適さない"]):
+            kpi(col, k, f"{int(vc.get(k, 0))}商品")
+        sel = st.multiselect("適性判定", ["適している", "テストで見極め", "適さない"],
+                             default=["適している", "テストで見極め", "適さない"])
+        st.caption("投資区分: 採算CPC（1クリックあたりの売上 ÷ 目標ROAS）で、キーワード投資／実績づくりのテスト／商品CPCのみ／停止候補 に分類。")
         inv = st.multiselect("投資区分", [INV_ATTACK, INV_TEST, INV_DEFEND, INV_STOP],
                              default=[INV_ATTACK, INV_TEST, INV_DEFEND, INV_STOP])
-        pf = plan.portfolio[plan.portfolio["投資区分"].isin(inv)]
+        pf = plan.portfolio[plan.portfolio["投資区分"].isin(inv) & plan.portfolio["適性判定"].isin(sel)]
+        front = ["広告適性", "適性判定", "投資区分", "商品管理番号", "商品名", "価格", "価格の出所", "損益分岐CPC", "採算CPC",
+                 "適性の理由", "判断"]
+        pf = pf[[c for c in front if c in pf.columns] + [c for c in pf.columns if c not in front]]
         st.dataframe(pf, use_container_width=True, hide_index=True,
                      column_config={"商品名": st.column_config.TextColumn(width="large"),
                                     "価格": st.column_config.NumberColumn(format="%d")})
+
+with tab_budget:
+    if plan.budget.empty:
+        st.info("サイドバーで月の広告予算を設定すると、優先度の高い配信から順に予算を割り当てます。")
+    else:
+        st.markdown(
+            "**配分の優先順位**: ① 目標ROASを達成している既存の配信 → ② 採算の合う新規キーワード → "
+            "③ 改善中の既存の配信 → ④ 広告適性の高い順のテスト配信（商品CPC×判定に必要なクリック数） → ⑤ 大幅赤字の既存配信。"
+            "予算の9割で打ち止めし、1割は配信量の変動に備えて残します。予算の付かない商品と広告に適さない商品は除外します。")
+        b = plan.budget
+        funded = b[b["予算"] == "配分"]
+        st.caption(f"配分 {len(funded)}件・見込み {funded['月の見込み費用'].sum():,.0f}円 ／ 月予算 {budget:,.0f}円"
+                   f"（1日あたり約{budget / 30:,.0f}円）")
+        show = st.radio("表示", ["配分したもの", "すべて"], horizontal=True)
+        st.dataframe(funded if show == "配分したもの" else b, use_container_width=True, hide_index=True,
+                     column_config={"CPC": st.column_config.NumberColumn(format="%d"),
+                                    "月の見込み費用": st.column_config.NumberColumn(format="%d"),
+                                    "累計": st.column_config.NumberColumn(format="%d")})
+        st.caption("月の見込み費用は目安です（既存の配信は期間中の1日あたり実績×30日、テストは判定に必要なクリック数×CPC）。"
+                   "実際の配信量は楽天側の表示機会で変わるため、RMSのキャンペーン「月予算」で上限を必ず設定してください。")
 
 with tab_items:
     if plan.items.empty:
@@ -266,7 +309,10 @@ with tab_plan:
                "ページ改善・除外候補・受注のあるキーワードの削除は、人の判断が必要なため初期状態はチェックなしです。")
     kinds = st.multiselect("表示する施策", [KW_UPDATE, KW_NEW, KW_DELETE, ITEM_CPC, ITEM_EXCLUDE, PAGE_FIX],
                            default=[KW_UPDATE, KW_NEW, KW_DELETE, ITEM_CPC, ITEM_EXCLUDE, PAGE_FIX])
+    only_exec = st.checkbox("実行するものだけ表示", value=False)
     shown = plan.actions[plan.actions["施策"].isin(kinds)]
+    if only_exec:
+        shown = shown[shown["実行"]]
     edited = st.data_editor(
         shown, use_container_width=True, hide_index=True, key="plan_editor",
         disabled=[c for c in shown.columns if c not in ("実行", "変更後CPC")],
@@ -309,6 +355,7 @@ with tab_out:
     kw_up = keyword_upload_from_actions(actions)
     item_cols = item_raw[0].columns if item_raw else None
     item_up = item_upload_from_actions(actions, item_cols)
+    ex_up = exclusion_upload_from_actions(actions)
     record = history_records(plan.__class__(**{**plan.__dict__, "actions": actions}), days)
 
     def csv_bytes(df, upload=False):
@@ -336,6 +383,12 @@ with tab_out:
                                f"rpp_item_upload_{stamp}.csv", "text/csv", use_container_width=True)
             st.dataframe(item_up, use_container_width=True, hide_index=True, height=240)
 
+    if len(ex_up):
+        st.markdown(f"##### 除外商品（{len(ex_up)}商品）")
+        st.caption("⚠️ 除外商品の一括登録の形式は、RMSのサンプルでまだ確認できていません（解説記事では n:登録／d:削除）。"
+                   "エラーが出た場合は、RMSの除外商品の一括登録用サンプルCSVを送ってください。")
+        st.download_button("⬇️ 除外商品 一括登録用CSV", csv_bytes(ex_up, True), f"rpp_exclude_upload_{stamp}.csv",
+                           "text/csv")
     st.markdown("##### 運用記録（次回、レポートと一緒に読み込んでください）")
     st.download_button("⬇️ 運用記録CSV", to_csv_bytes(record, "utf-8-sig"), f"rpp_運用記録_{stamp}.csv", "text/csv")
 
@@ -345,6 +398,10 @@ with tab_out:
             z.writestr(f"rpp_keyword_upload_{stamp}.csv", csv_bytes(kw_up, True))
         if len(item_up):
             z.writestr(f"rpp_item_upload_{stamp}.csv", csv_bytes(item_up, True))
+        if len(ex_up):
+            z.writestr(f"rpp_exclude_upload_{stamp}.csv", csv_bytes(ex_up, True))
+        if not plan.budget.empty:
+            z.writestr(f"rpp_予算配分_{stamp}.csv", to_csv_bytes(plan.budget, "utf-8-sig"))
         z.writestr(f"rpp_運用記録_{stamp}.csv", to_csv_bytes(record, "utf-8-sig"))
         z.writestr(f"rpp_アクションプラン_{stamp}.csv", to_csv_bytes(actions, "utf-8-sig"))
         if not plan.items.empty:
@@ -358,10 +415,12 @@ with tab_out:
 
     st.markdown(
         """
-**RMSへの反映**
-1. RMS → 広告 → RPP →「商品・キーワード設定」→「一括アップロード」
-2. キーワードは「**キーワードCPCの登録/更新**」、商品は「**商品CPCの登録/更新**」を選び、上のCSVをそのままアップロード
-3. エラー結果CSVが返ってきた場合は、内容を確認（よくある例：「既に登録済」→ そのキーワードの n を u に変更）
+**RMSへの反映（この順番で）**
+1. RPPのキャンペーン設定で **月予算** をサイドバーの金額に、**キャンペーンCPC** を商品CPCの下限（初期値20円）に設定
+2. 除外商品を登録（予算を付けない商品に費用が流れないようにする）
+3. RMS → 広告 → RPP →「商品・キーワード設定」→「一括アップロード」で、キーワードは「**キーワードCPCの登録/更新**」、商品は「**商品CPCの登録/更新**」から上のCSVをそのままアップロード
+4. エラー結果CSVが返ってきた場合は内容を確認（例：「既に登録済」→ そのキーワードの n を u に変更）
+5. 1週間後に新しいレポートと「運用記録CSV」を入れて、次の運用へ
 
 ⚠️ アップロード用CSVは **Excelで開いて上書き保存しない** でください。商品管理番号が「4.57E+12」の形に変わり、正しく登録できなくなります。
 """

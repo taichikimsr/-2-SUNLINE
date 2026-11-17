@@ -88,6 +88,7 @@ class Strategy:
     delete_ratio: float = 1.0          # 粗利1件分 × この倍率 を使って受注0なら削除
     keep_band: float = 0.05
     assumed_cvr: float = 1.0           # 実績の無い商品に使う想定CVR(%)（店舗の実績があれば実績と混ぜる）
+    monthly_budget: float = 0.0        # 月予算（円）。0なら予算配分・除外は行わない
 
     @property
     def mult(self) -> float:
@@ -114,6 +115,7 @@ class Plan:
     notes: List[str] = field(default_factory=list)
     candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
     portfolio: pd.DataFrame = field(default_factory=pd.DataFrame)
+    budget: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 # ------------------------------------------------------------------ 共通計算
@@ -494,14 +496,32 @@ def build_plan(
                      f"（{s.min_kw_cpc}円）に届かず、今追加すると赤字になるため投入していません"
                      + (f"（うち{waiting}件は実績づくり後に投入する「待機」）" if waiting else "")
                      + "。「キーワード設計」タブで商品ごとの候補と理由を確認できます。売上拡大モードでは下限CPCで追加します。")
+    # ---------------- 広告適性と月予算
+    from .budget import allocate_budget, suitability
+    brand_terms = _brand_terms(universe, registered)
+    suit = suitability(universe, s, search_kw=search_kw, brand_terms=brand_terms)
+    budget_table = pd.DataFrame()
+    if s.monthly_budget and s.monthly_budget > 0:
+        act, budget_table, excluded = allocate_budget(act, universe, suit, kw_out, items, s, s.monthly_budget,
+                                                      period_days)
+        act = act.sort_values(["優先度", "施策", "商品管理番号"], kind="stable").reset_index(drop=True)
+        funded = budget_table.loc[budget_table["予算"] == "配分", "月の見込み費用"].sum() if not budget_table.empty else 0
+        summary["月予算"] = s.monthly_budget
+        summary["配分した見込み費用"] = funded
+        summary["除外する商品数"] = len(excluded)
+        summary["アクション数"] = int(act["実行"].sum())
     portfolio = _portfolio(universe, act, registered, s)
+    if not portfolio.empty:
+        portfolio = portfolio.merge(suit, on="商品管理番号", how="left")
+        portfolio = portfolio.sort_values("広告適性", ascending=False, kind="stable").reset_index(drop=True)
     summary["全商品数"] = len(portfolio)
     for k in (INV_ATTACK, INV_TEST, INV_DEFEND, INV_STOP):
         summary[k] = int((portfolio["投資区分"] == k).sum()) if not portfolio.empty else 0
     return Plan(items=items, keywords=kw_out, actions=act,
                 summary={k: (float(v) if isinstance(v, (int, float, np.number)) and v is not None else v)
                          for k, v in summary.items()},
-                feedback=pd.DataFrame(feedback_rows), notes=notes, candidates=cand_df, portfolio=portfolio)
+                feedback=pd.DataFrame(feedback_rows), notes=notes, candidates=cand_df, portfolio=portfolio,
+                budget=budget_table)
 
 
 def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
@@ -612,6 +632,39 @@ def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
 
 ITEM_COLUMNS = ["商品管理番号", "商品名", "クリック数", "実績額", "売上金額", "売上件数", "評価売上", "粗利率",
                 "目標ROAS(%)", "客単価", "1クリック売上", "目標CPC", "分類", "CVR(%)", "ROAS(%)", "粗利-広告費"]
+
+
+def _brand_terms(universe: pd.DataFrame, registered: Dict[str, set]) -> set:
+    """ブランド・作品名らしい語: 店舗カテゴリのブランド名、1語で登録済みのキーワード、複数商品の商品名に共通する固有の語"""
+    from collections import Counter
+
+    from .keywords import ATTRIBUTE_WORDS, CATEGORY_WORDS, tokenize
+
+    terms = set()
+    for kws in registered.values():
+        terms |= {k for k in kws if " " not in k}
+    if "カテゴリ" in universe:
+        for path in universe["カテゴリ"].astype(str):
+            terms |= category_terms(path)[1]
+    import re
+
+    toks = [{t.lower() for t in tokenize(n)} for n in universe["商品名"].astype(str)]
+    df: Counter = Counter()
+    for ts in toks:
+        df.update(ts)
+    # 英字のブランド名（例: blokees, dhc, elixir）
+    for t, c in df.items():
+        if c >= 2 and re.fullmatch(r"[a-z][a-z0-9&.\-]{2,}", t) and t not in CATEGORY_WORDS:
+            terms.add(t)
+    # ブランドの商品にほぼ必ず一緒に出てくる語（例: Blokees と一緒に出る マーベル・スターウォーズ ＝ 作品名）
+    anchors = set(terms)
+    for t, c in df.items():
+        if c < 3 or t in CATEGORY_WORDS or t in ATTRIBUTE_WORDS or t in anchors:
+            continue
+        with_brand = sum(1 for ts in toks if t in ts and ts & anchors)
+        if with_brand >= 0.8 * c:
+            terms.add(t)
+    return terms
 
 
 def _empty_items() -> pd.DataFrame:
