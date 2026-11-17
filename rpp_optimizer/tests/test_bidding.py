@@ -146,3 +146,28 @@ def test_csv_encoding_error_message():
     with pytest.raises(ValueError):
         to_csv_bytes(df, "cp932")
     assert to_csv_bytes(pd.DataFrame({"a": ["テスト"]}), "cp932").decode("cp932").startswith("a\r\n")
+
+
+def test_read_rms_style_preamble():
+    # 説明行に「商品管理番号」を含む1列の行があっても、本当のヘッダー行を見つける
+    text = (
+        "楽天RPPレポート\r\n"
+        "期間：2026/10/18～2026/11/16\r\n"
+        "検索条件：商品管理番号 指定なし\r\n"
+        "\r\n"
+        "日付,商品管理番号,商品名,クリック数(合計),実績額(合計),売上金額(合計720時間),売上件数(合計720時間)\r\n"
+        "2026/11/01,a-1,商品A,10,500,3000,1\r\n"
+        "2026/11/02,a-1,商品A,20,1000,0,0\r\n"
+        "合計,,,30,1500,3000,1,余分な列\r\n"
+    )
+    df = read_csv_bytes(text.encode("cp932"))
+    assert df.columns[1] == "商品管理番号"
+    assert len(df) == 3
+    cmap = ColumnMap.from_dict(detect_columns(df.columns, prefer_window="720"))
+    rep = normalize_report(df, cmap, "item")
+    assert len(rep) == 1 and rep.iloc[0]["クリック数"] == 30
+
+
+def test_read_duplicate_headers():
+    df = read_csv_bytes("商品管理番号,CPC,CPC\na,1,2\n".encode("utf-8"))
+    assert list(df.columns) == ["商品管理番号", "CPC", "CPC_1"]

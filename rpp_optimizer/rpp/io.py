@@ -69,30 +69,61 @@ def decode_bytes(data: bytes) -> str:
     raise ValueError("文字コードを判定できませんでした（UTF-8 / Shift_JIS 以外の可能性があります）")
 
 
-def _find_header_row(lines: List[str]) -> int:
-    for idx, line in enumerate(lines[:30]):
-        norm = normalize_header(line)
-        if any(h in norm for h in HEADER_HINTS):
+def _parse_rows(text: str) -> List[List[str]]:
+    """カンマ区切り／タブ区切りを判定して全行を読む（行ごとに列数が違ってもエラーにしない）"""
+    sample = "\n".join(text.splitlines()[:50])
+    sep = "\t" if sample.count("\t") > sample.count(",") else ","
+    return [[c.strip() for c in row] for row in csv.reader(io.StringIO(text), delimiter=sep)]
+
+
+def _find_header_row(rows: List[List[str]]) -> int:
+    """ヘッダー行を探す。
+
+    RMSのレポートは先頭に「期間」「検索条件」などの説明行が入ることがあるため、
+    ・「商品管理番号」「キーワード」を含むセルがあり
+    ・空でないセルが3つ以上ある
+    最初の行をヘッダーとみなす。見つからなければ、列数が最も多い最初の行を使う。
+    """
+    for idx, row in enumerate(rows[:50]):
+        cells = [normalize_header(c) for c in row if c.strip()]
+        if len(cells) >= 3 and any(any(h in c for h in HEADER_HINTS) for c in cells):
             return idx
-    return 0
+    widths = [len([c for c in r if c.strip()]) for r in rows[:50]]
+    return widths.index(max(widths)) if widths else 0
+
+
+def _unique(names: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    out = []
+    for i, n in enumerate(names):
+        n = n or f"列{i + 1}"
+        if n in seen:
+            seen[n] += 1
+            n = f"{n}_{seen[n]}"
+        else:
+            seen[n] = 0
+        out.append(n)
+    return out
 
 
 def read_csv_bytes(data: bytes) -> pd.DataFrame:
-    """RMS形式のCSVを読み込む（文字コード・ヘッダー行を自動判定）。値は文字列のまま返す。"""
+    """RMS形式のCSVを読み込む（文字コード・ヘッダー行を自動判定）。値は文字列のまま返す。
+
+    ヘッダーより前の説明行は読み飛ばし、ヘッダーより列数が多い／少ない行は切り詰め・空欄補完する。
+    """
     text = decode_bytes(data)
-    lines = text.splitlines()
-    header_idx = _find_header_row(lines)
-    body = "\n".join(lines[header_idx:])
-    try:
-        dialect = csv.Sniffer().sniff(lines[header_idx] if lines else ",", delimiters=",\t")
-        sep = dialect.delimiter
-    except csv.Error:
-        sep = ","
-    df = pd.read_csv(io.StringIO(body), sep=sep, dtype=str, keep_default_na=False)
-    df.columns = [str(c).strip() for c in df.columns]
-    # 全列が空の行（合計行の後の空行など）を除外
-    df = df[~(df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
-    return df.reset_index(drop=True)
+    rows = _parse_rows(text)
+    if not rows:
+        raise ValueError("CSVが空です")
+    h = _find_header_row(rows)
+    header = _unique(rows[h])
+    n = len(header)
+    body = []
+    for row in rows[h + 1:]:
+        if not any(c.strip() for c in row):
+            continue  # 空行
+        body.append((row + [""] * n)[:n])
+    return pd.DataFrame(body, columns=header, dtype=str)
 
 
 def detect_column(columns: Iterable[str], field: str, prefer: Optional[str] = None) -> Optional[str]:
