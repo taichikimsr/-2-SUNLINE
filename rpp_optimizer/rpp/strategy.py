@@ -36,7 +36,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .keywords import normalize_keyword, relevance, title_candidates, token_document_frequency
+from .keywords import (
+    category_terms, normalize_keyword, relevance, script_aliases, title_candidates, token_document_frequency,
+)
 
 # アクション種別
 KW_UPDATE = "キーワードCPC変更"
@@ -52,6 +54,13 @@ CLS_KEEP = "維持"
 CLS_TUNE = "調整"
 CLS_STRUCT = "構造的赤字"
 CLS_DATA = "データ不足"
+CLS_NEW = "未配信（推定）"
+
+# 投資区分（全商品のポートフォリオ）
+INV_ATTACK = "攻め（キーワード投資）"
+INV_DEFEND = "守り（商品CPCのみ）"
+INV_STOP = "停止候補"
+INV_TEST = "テスト（実績づくり）"
 
 MODES = {
     # 目標ROAS ＝ 損益分岐ROAS × 係数
@@ -78,6 +87,7 @@ class Strategy:
     new_kw_max_cpc: int = 80           # 新規キーワードのテスト用CPCの上限
     delete_ratio: float = 1.0          # 粗利1件分 × この倍率 を使って受注0なら削除
     keep_band: float = 0.05
+    assumed_cvr: float = 1.0           # 実績の無い商品に使う想定CVR(%)（店舗の実績があれば実績と混ぜる）
 
     @property
     def mult(self) -> float:
@@ -103,6 +113,7 @@ class Plan:
     feedback: pd.DataFrame = field(default_factory=pd.DataFrame)
     notes: List[str] = field(default_factory=list)
     candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
+    portfolio: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 # ------------------------------------------------------------------ 共通計算
@@ -265,10 +276,18 @@ def build_plan(
     search_kw: Optional[pd.DataFrame] = None,
     history: Optional[pd.DataFrame] = None,
     period_days: Optional[int] = None,
+    catalog: Optional[pd.DataFrame] = None,
 ) -> Plan:
     notes: List[str] = []
-    items = diagnose_items(item_rep, kw_rep, master, s)
-    if (items["_source"] == "キーワード別から合算").any():
+    if (item_rep is None or item_rep.empty) and (kw_rep is None or kw_rep.empty):
+        if catalog is None or catalog.empty:
+            raise ValueError("RPPのレポートか商品一覧が必要です")
+        items = _empty_items()
+        notes.append("RPPのレポートが無いため、全商品を想定CVRと価格から推定して設計しています。"
+                     "レポートを入れると実績にもとづく判断に切り替わります。")
+    else:
+        items = diagnose_items(item_rep, kw_rep, master, s)
+    if "_source" in items and (items["_source"] == "キーワード別から合算").any():
         notes.append("商品別レポートが無いため、キーワード別レポートを商品ごとに合算して診断しています。"
                      "商品CPCの調整と、キーワード以外の配信の評価には商品別レポートが必要です。")
     item_map = items.set_index("商品管理番号")
@@ -386,7 +405,8 @@ def build_plan(
         kw_out = pd.DataFrame(kw_rows)
 
     # ---------------- 商品CPC・除外・ページ改善
-    has_item_report = (items["_source"] == "商品別").all()
+    has_item_report = not items.empty and (items["_source"] == "商品別").all()
+    has_item_report_flag = has_item_report
     for _, it in items.iterrows():
         iid = it["商品管理番号"]
         cls = it["分類"]
@@ -425,7 +445,23 @@ def build_plan(
                 execute=False, priority=2, impact=f"KW外の広告費{_fmt(nk_sp)}円")
 
     # ---------------- 新規キーワード
-    new_kw, cand_df = _new_keywords(items, kw_rep, search_kw, registered, s)
+    universe = build_universe(items, catalog, master, s)
+    if catalog is not None and not catalog.empty:
+        reported = set(items["商品管理番号"]) if not items.empty else set()
+        for _, u in universe[universe["分類"] == CLS_NEW].iterrows():
+            if u["商品管理番号"] in reported or pd.isna(u["目標CPC"]):
+                continue
+            cpc = int(round(_clamp(u["目標CPC"], s.min_item_cpc, max(s.min_item_cpc, s.min_kw_cpc - 1))))
+            add(ITEM_CPC, u["商品管理番号"], "", None, cpc,
+                f"RPPの実績なし。推定の採算CPC {u['目標CPC']:.0f}円（価格{_fmt(u['客単価'])}円×想定CVR・{u['価格の出所']}）。"
+                f"商品CPC {cpc}円で少額配信して実際のCVRを測る",
+                ctrl="n", execute=has_item_report_flag, priority=3, impact="テスト配信")
+    if catalog is not None and not catalog.empty:
+        no_price = universe["価格の出所"].eq("店舗平均（推定）").sum()
+        if no_price:
+            notes.append(f"{no_price}商品は販売価格が分からないため、店舗の平均客単価で推定しています。"
+                         "販売価格の入った商品一覧（RMSの商品CSVなど）を入れると精度が上がります。")
+    new_kw, cand_df = _new_keywords(universe, kw_rep, search_kw, registered, s)
     for row in new_kw:
         add(KW_NEW, row["商品管理番号"], row["キーワード"], None, row["CPC"], row["根拠"], "n",
             True, 2, impact=row["影響"])
@@ -446,27 +482,43 @@ def build_plan(
         "広告費": spend,
         "売上": sales,
         "ROAS(%)": sales / spend * 100 if spend > 0 else np.nan,
-        "粗利-広告費": float(items["粗利-広告費"].sum()),
+        "粗利-広告費": float(items["粗利-広告費"].sum()) if "粗利-広告費" in items else 0.0,
         "削除対象の広告費": del_spend,
-        "構造的赤字の商品数": int((items["分類"] == CLS_STRUCT).sum()),
+        "構造的赤字の商品数": int((items["分類"] == CLS_STRUCT).sum()) if "分類" in items else 0,
         "アクション数": int(act["実行"].sum()),
         "新規キーワード数": int((act["施策"] == KW_NEW).sum()),
     }
     if not cand_df.empty and new_kw == []:
-        notes.append("新規キーワード候補はありますが、想定1クリック売上から計算したCPCがキーワード下限"
-                     f"（{s.min_kw_cpc}円）に届かず、追加すると赤字になるため見送りました。"
-                     "「キーワード候補」タブで候補と理由を確認できます。売上拡大モードでは下限CPCで追加します。")
-    return Plan(items=items, keywords=kw_out, actions=act, summary={k: (float(v) if isinstance(v, (int, float, np.number)) and v is not None else v) for k, v in summary.items()},
-                feedback=pd.DataFrame(feedback_rows), notes=notes, candidates=cand_df)
+        waiting = cand_df["判定"].str.startswith("待機").sum()
+        notes.append(f"新規キーワード候補を{len(cand_df)}件作成しましたが、想定1クリック売上から計算したCPCがキーワード下限"
+                     f"（{s.min_kw_cpc}円）に届かず、今追加すると赤字になるため投入していません"
+                     + (f"（うち{waiting}件は実績づくり後に投入する「待機」）" if waiting else "")
+                     + "。「キーワード設計」タブで商品ごとの候補と理由を確認できます。売上拡大モードでは下限CPCで追加します。")
+    portfolio = _portfolio(universe, act, registered, s)
+    summary["全商品数"] = len(portfolio)
+    for k in (INV_ATTACK, INV_TEST, INV_DEFEND, INV_STOP):
+        summary[k] = int((portfolio["投資区分"] == k).sum()) if not portfolio.empty else 0
+    return Plan(items=items, keywords=kw_out, actions=act,
+                summary={k: (float(v) if isinstance(v, (int, float, np.number)) and v is not None else v)
+                         for k, v in summary.items()},
+                feedback=pd.DataFrame(feedback_rows), notes=notes, candidates=cand_df, portfolio=portfolio)
 
 
 def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
     names = dict(zip(items["商品管理番号"], items["商品名"].astype(str)))
+    vpc_map = dict(zip(items["商品管理番号"], items["1クリック売上"].astype(float)))
+    cat_map = dict(zip(items["商品管理番号"], items["カテゴリ"].astype(str))) if "カテゴリ" in items else {}
     doc_freq = token_document_frequency(names.values())
-    # 1語で登録されているキーワード（例: blokees）はブランド名として扱う
+    # 1語で登録されているキーワード（例: blokees）や、店舗カテゴリ名にあるブランド（例: 資生堂・ELIXIR）はブランド名として扱う
     brand_like = set()
     for kws in registered.values():
         brand_like |= {k for k in kws if " " not in k}
+    aliases = script_aliases(names.values())
+    item_cats = {}
+    for iid, path in cat_map.items():
+        cats, brands = category_terms(path)
+        item_cats[iid] = cats
+        brand_like |= brands
 
     candidates: Dict[str, Dict[str, dict]] = {}
 
@@ -480,7 +532,8 @@ def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
 
     # 1) 検索キーワードデータ（需要が実在する語）
     if search_kw is not None and not search_kw.empty and "キーワード" in search_kw:
-        for _, q in search_kw.iterrows():
+        sk = search_kw.sort_values("アクセス数", ascending=False).head(500) if "アクセス数" in search_kw else search_kw
+        for _, q in sk.iterrows():
             kw = str(q["キーワード"]).strip()
             if not kw or kw.lower() == "nan":
                 continue
@@ -492,7 +545,7 @@ def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
             for iid in targets:
                 if iid not in names:
                     continue
-                item_vpc = float(items.set_index("商品管理番号").loc[iid, "1クリック売上"])
+                item_vpc = vpc_map[iid]
                 exp = item_vpc if math.isnan(kw_vpc) else 0.5 * item_vpc + 0.5 * kw_vpc
                 score = 3.0 + math.log1p(acc) + (2.0 if sales > 0 else 0.0)
                 offer(iid, kw, score, exp, f"検索キーワードデータで流入{acc:.0f}件・売上{_fmt(sales)}円の実績",
@@ -506,16 +559,16 @@ def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
             for iid, n in names.items():
                 if iid == w["商品管理番号"] or relevance(w["キーワード"], n) < 0.999:
                     continue
-                item_vpc = float(items.set_index("商品管理番号").loc[iid, "1クリック売上"])
+                item_vpc = vpc_map[iid]
                 exp = item_vpc if math.isnan(kw_vpc) else 0.6 * kw_vpc + 0.4 * item_vpc
                 offer(iid, w["キーワード"], 2.5 + float(w["売上件数"]), exp,
                       f"別商品（{w['商品管理番号']}）で{w['売上件数']:.0f}件受注した語。商品名にも含まれるため横展開")
 
     # 3) 商品名から作る組み合わせ
     for iid, n in names.items():
-        item_vpc = float(items.set_index("商品管理番号").loc[iid, "1クリック売上"])
-        for kw, score, reason in title_candidates(n, doc_freq, len(names), extra_anchors=brand_like):
-            offer(iid, kw, score, item_vpc, reason)
+        for kw, score, reason in title_candidates(n, doc_freq, len(names), extra_anchors=brand_like,
+                                                  extra_categories=item_cats.get(iid, set()), aliases=aliases):
+            offer(iid, kw, score, vpc_map[iid], reason)
 
     out: List[dict] = []
     log: List[dict] = []
@@ -532,8 +585,13 @@ def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
             status = ""
             if cls == CLS_STRUCT and not s.allow_unprofitable_new:
                 status = "見送り（商品が構造的赤字。先にページ改善が必要）"
+            elif math.isnan(target) or math.isnan(c["exp_vpc"]):
+                status = "見送り（価格が分からず採算を計算できない）"
             elif picked >= limit:
                 status = "見送り（今回の追加上限・登録枠）"
+            elif cpc_raw < s.min_kw_cpc and not s.allow_unprofitable_new and cls == CLS_NEW:
+                status = (f"待機（推定の採算CPC {cpc_raw:.0f}円が下限{s.min_kw_cpc}円未満。"
+                          "商品CPCで実績を取り、CVRが確認できたら投入）")
             elif cpc_raw < s.min_kw_cpc and not s.allow_unprofitable_new:
                 status = f"見送り（採算CPC {cpc_raw:.0f}円が下限{s.min_kw_cpc}円未満）"
             cpc = int(round(_clamp(max(cpc_raw, s.min_kw_cpc), s.min_kw_cpc, min(s.new_kw_max_cpc, s.max_cpc))))
@@ -550,6 +608,119 @@ def _new_keywords(items, kw_rep, search_kw, registered, s: Strategy):
                         "スコア": round(c["score"], 2), "想定1クリック売上": round(c["exp_vpc"], 1),
                         "採算CPC": round(cpc_raw, 1), "テストCPC": cpc, "根拠": c["根拠"], "判定": status})
     return out, pd.DataFrame(log)
+
+
+ITEM_COLUMNS = ["商品管理番号", "商品名", "クリック数", "実績額", "売上金額", "売上件数", "評価売上", "粗利率",
+                "目標ROAS(%)", "客単価", "1クリック売上", "目標CPC", "分類", "CVR(%)", "ROAS(%)", "粗利-広告費"]
+
+
+def _empty_items() -> pd.DataFrame:
+    df = pd.DataFrame(columns=ITEM_COLUMNS + ["_source"])
+    df.attrs["store_vpc"] = np.nan
+    df.attrs["store_aov"] = np.nan
+    return df
+
+
+def build_universe(items: pd.DataFrame, catalog: Optional[pd.DataFrame], master: Optional[pd.DataFrame],
+                   s: Strategy) -> pd.DataFrame:
+    """RPPの実績がある商品 ＋ 商品一覧にしか無い商品 を1つの表にする（全商品をゼロベースで設計するため）。
+
+    実績の無い商品の1クリック売上 ＝ 販売価格 × 想定CVR
+      販売価格: 商品一覧の価格 → 店舗カテゴリの価格（500円均一など）→ 店舗の平均客単価 の順に使う
+      想定CVR : 店舗のRPP実績のCVRを、設定の想定CVRに寄せて補正した値
+    """
+    u = items.copy()
+    if "カテゴリ" not in u:
+        u["カテゴリ"] = ""
+    u["価格の出所"] = "RPP実績"
+    clicks = pd.to_numeric(u["クリック数"], errors="coerce").sum() if not u.empty else 0
+    orders = pd.to_numeric(u["売上件数"], errors="coerce").sum() if not u.empty else 0
+    k = 300.0
+    store_cvr = (orders + s.assumed_cvr / 100.0 * k) / (clicks + k)
+    store_aov = items.attrs.get("store_aov", np.nan)
+
+    if catalog is None or catalog.empty:
+        u.attrs["store_cvr"] = store_cvr
+        return u
+
+    cat = catalog.copy()
+    cat_by_id = cat.set_index("商品管理番号")
+    # 実績がある商品にも店舗カテゴリを付ける
+    u["カテゴリ"] = u["商品管理番号"].map(cat_by_id["カテゴリ"]).fillna("") if "カテゴリ" in cat_by_id else ""
+    known_prices = cat["販売価格"].dropna()
+    if (store_aov is None or (isinstance(store_aov, float) and math.isnan(store_aov))) and not known_prices.empty:
+        store_aov = float(known_prices.median())
+
+    m = None
+    if master is not None and not master.empty:
+        m = master.drop_duplicates("商品管理番号", keep="last").set_index("商品管理番号")
+
+    rows = []
+    for _, c in cat[~cat["商品管理番号"].isin(set(u["商品管理番号"]))].iterrows():
+        iid = c["商品管理番号"]
+        margin = c.get("粗利率")
+        if m is not None and iid in m.index and "粗利率" in m and pd.notna(m.loc[iid, "粗利率"]):
+            margin = m.loc[iid, "粗利率"]
+        margin = float(margin) if pd.notna(margin) and margin > 0 else s.default_margin
+        target = c.get("目標ROAS")
+        if m is not None and iid in m.index and "目標ROAS" in m and pd.notna(m.loc[iid, "目標ROAS"]):
+            target = m.loc[iid, "目標ROAS"]
+        target = float(target) if pd.notna(target) and target > 0 else 100.0 / (margin / 100.0) * s.mult
+        if pd.notna(c.get("販売価格")) and c["販売価格"] > 0:
+            price, src = float(c["販売価格"]), "商品一覧の価格"
+        elif pd.notna(c.get("価格の目安")) and c["価格の目安"] > 0:
+            price, src = float(c["価格の目安"]), "店舗カテゴリの価格"
+        else:
+            price, src = store_aov, "店舗平均（推定）"
+        vpc = price * store_cvr if price is not None and not math.isnan(price) else np.nan
+        rows.append({
+            "商品管理番号": iid, "商品名": c["商品名"], "カテゴリ": c.get("カテゴリ", ""), "クリック数": 0, "実績額": 0,
+            "売上金額": 0, "売上件数": 0, "評価売上": 0, "粗利率": margin, "目標ROAS(%)": round(target, 0),
+            "客単価": price, "1クリック売上": vpc,
+            "目標CPC": round(vpc / (target / 100.0), 1) if not math.isnan(vpc) else np.nan,
+            "分類": CLS_NEW, "価格の出所": src,
+        })
+    if rows:
+        u = pd.concat([u, pd.DataFrame(rows)], ignore_index=True)
+    u.attrs["store_cvr"] = store_cvr
+    return u
+
+
+def _portfolio(universe: pd.DataFrame, act: pd.DataFrame, registered: Dict[str, set], s: Strategy) -> pd.DataFrame:
+    """全商品の投資区分（攻め／守り／停止候補）と、キーワードの登録状況"""
+    if universe.empty:
+        return pd.DataFrame()
+    new_cnt = act[act["施策"] == KW_NEW].groupby("商品管理番号").size()
+    del_cnt = act[(act["施策"] == KW_DELETE) & act["実行"]].groupby("商品管理番号").size()
+    rows = []
+    for _, u in universe.iterrows():
+        iid = u["商品管理番号"]
+        tcpc = u.get("目標CPC")
+        cls = u.get("分類")
+        if pd.isna(tcpc):
+            inv, why = INV_DEFEND, "価格が分からないため商品CPCのみで様子見"
+        elif cls == CLS_NEW and tcpc < s.min_kw_cpc:
+            inv, why = INV_TEST, (f"RPPの実績なし。推定の採算CPC {tcpc:.0f}円（価格×想定CVR）ではキーワード下限に届かないため、"
+                                  "まず商品CPCで少額配信し、実際のCVRを測る")
+        elif cls == CLS_STRUCT:
+            inv, why = INV_DEFEND, "構造的赤字。ページ改善でCVRが上がるまでキーワード投資はしない"
+        elif tcpc >= s.min_kw_cpc:
+            inv, why = INV_ATTACK, f"採算CPC {tcpc:.0f}円 ≥ キーワード下限{s.min_kw_cpc}円"
+        elif tcpc >= s.min_item_cpc:
+            inv, why = INV_DEFEND, f"採算CPC {tcpc:.0f}円。キーワード下限{s.min_kw_cpc}円では赤字になるため商品CPCで低く配信"
+        else:
+            inv, why = INV_STOP, f"採算CPC {tcpc:.0f}円が商品CPCの下限{s.min_item_cpc}円未満。除外を検討"
+        reg = len(registered.get(iid, set()))
+        rows.append({
+            "投資区分": inv, "商品管理番号": iid, "商品名": u["商品名"], "分類": cls,
+            "価格": u.get("客単価"), "価格の出所": u.get("価格の出所"), "粗利率": u.get("粗利率"),
+            "目標ROAS(%)": u.get("目標ROAS(%)"), "1クリック売上": None if pd.isna(u.get("1クリック売上")) else round(float(u["1クリック売上"]), 1),
+            "採算CPC": None if pd.isna(tcpc) else round(float(tcpc), 1),
+            "登録済みKW": reg, "今回追加KW": int(new_cnt.get(iid, 0)), "今回削除KW": int(del_cnt.get(iid, 0)),
+            "判断": why,
+        })
+    order = {INV_ATTACK: 0, INV_TEST: 1, INV_DEFEND: 2, INV_STOP: 3}
+    return pd.DataFrame(rows).sort_values(["投資区分", "採算CPC"], key=lambda c: c.map(order) if c.name == "投資区分" else -c.fillna(-1)).reset_index(drop=True)
 
 
 def _diverse_order(cands: List[dict]) -> List[dict]:

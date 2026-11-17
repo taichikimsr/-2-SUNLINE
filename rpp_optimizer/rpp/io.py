@@ -179,6 +179,7 @@ def classify_dataset(df: pd.DataFrame) -> str:
     keyword_report : RPPキーワード別レポート（商品管理番号＋キーワード＋クリック数）
     item_report    : RPP商品別レポート（商品管理番号＋クリック数、キーワード列なし）
     search_keywords: 検索キーワード等の流入データ（キーワード＋アクセス/売上、クリック数なし）
+    catalog        : 商品一覧（商品管理番号＋商品名＋販売価格など。RMSの商品CSVやアクセス分析の商品別データ）
     master         : 商品マスタ（商品管理番号＋粗利率/目標ROAS）
     history        : 本ツールが出力した運用記録
     unknown        : 判定できない
@@ -195,8 +196,12 @@ def classify_dataset(df: pd.DataFrame) -> str:
         return "item_report"
     if (exact("キーワード") or exact("検索キーワード")) and (has("アクセス") or has("売上") or has("訪問")):
         return "search_keywords"
+    if has("商品管理番号") and (has("価格") or (has("商品名") and has("売上"))):
+        return "catalog"
     if has("商品管理番号") and (has("粗利率") or has("目標roas") or has("利益率")):
         return "master"
+    if has("商品管理番号") and has("商品名"):
+        return "catalog"
     return "unknown"
 
 

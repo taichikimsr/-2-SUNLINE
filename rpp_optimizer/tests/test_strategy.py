@@ -120,3 +120,61 @@ def test_real_rms_header_without_item_report():
     p = build_plan(None, prepare_report(kwr, "keyword"), Strategy(default_margin=40), period_days=30)
     assert any("商品別レポートが無い" in n for n in p.notes)
     assert not (p.actions["施策"] == ITEM_CPC).any()
+
+
+def _catalog():
+    from rpp.datasets import prepare_catalog
+    text = (
+        "コントロールカラム,商品管理番号（商品URL）,商品名,表示先カテゴリ,優先度\r\n"
+        '"","smp-001","【正規品】サンプルブランド 星の騎士 フィギュア 可動 プラモデル","BLOKEES ブロッキーズ","1"\r\n'
+        '"","new-01","DHC 薬用リップクリーム 保湿 リップクリーム 無香料","コスメ・ビューティー\\\\リップケア\\\\リップクリーム","1"\r\n'
+        '"","new-01","DHC 薬用リップクリーム 保湿 リップクリーム 無香料","『500円均一』セレクション","1"\r\n'
+        '"","new-02","エクササイズバンド トレーニングチューブ 筋トレ 美尻","アウトドア・レジャー\\\\筋トレ","1"\r\n'
+    )
+    df = read_csv_bytes(text.encode("cp932"))
+    assert classify_dataset(df) == "catalog"
+    return prepare_catalog(df)
+
+
+def test_catalog_zero_base():
+    cat = _catalog()
+    assert len(cat) == 3  # 同じ商品の重複行はまとめる
+    assert cat.set_index("商品管理番号").loc["new-01", "価格の目安"] == 500
+    item = _read("rms_item_report_sample.csv")
+    kwr = _read("rms_keyword_report_sample.csv")
+    p = build_plan(prepare_report(item, "item"), prepare_report(kwr, "keyword"),
+                   Strategy(default_margin=40, assumed_cvr=3), catalog=cat, period_days=30)
+    pf = p.portfolio.set_index("商品管理番号")
+    assert {"new-01", "new-02", "smp-001"} <= set(pf.index)
+    assert pf.loc["new-01", "価格の出所"] == "店舗カテゴリの価格"
+    # 500円の商品はキーワード下限では採算が合わない → テスト（実績づくり）
+    from rpp.strategy import INV_TEST
+    assert pf.loc["new-01", "投資区分"] == INV_TEST
+    c = p.candidates
+    kws = set(c[c["商品管理番号"] == "new-01"]["キーワード"])
+    assert "DHC 薬用リップクリーム" in kws or "DHC リップクリーム" in kws
+    assert any("保湿" in k and "リップクリーム" in k for k in kws)  # 悩み・特徴×カテゴリー
+    kws2 = set(c[c["商品管理番号"] == "new-02"]["キーワード"])
+    assert "エクササイズバンド" in kws2  # ブランドの無い商品は商品の種類そのもの
+    # 実績の無い商品は商品CPCのテスト配信（n）
+    a = p.actions
+    t = a[(a["施策"] == ITEM_CPC) & (a["商品管理番号"] == "new-01")].iloc[0]
+    assert t["コントロール"] == "n" and t["変更後CPC"] >= 20
+
+
+def test_catalog_only():
+    p = build_plan(None, None, Strategy(default_margin=40), catalog=_catalog())
+    assert len(p.portfolio) == 3
+    assert any("レポートが無い" in n for n in p.notes)
+
+
+def test_keyword_quality_rules():
+    from rpp.keywords import script_aliases
+    names = ["Attenir アテニア ローション 化粧水", "Attenir アテニア リップオイル", "アテニア Attenir 乳液"]
+    al = script_aliases(names)
+    assert frozenset(("attenir", "アテニア")) in al
+    df = token_document_frequency(names)
+    kws = [k for k, _, _ in title_candidates("【新店Open 特別価格】資生堂 エリクシール 81146GV06 9歳以上 化粧水 乾燥肌",
+                                              df, 3, extra_anchors={"資生堂"})]
+    assert not any("特別価格" in k or "81146" in k or "9歳" in k for k in kws)
+    assert "乾燥肌 化粧水" in kws
