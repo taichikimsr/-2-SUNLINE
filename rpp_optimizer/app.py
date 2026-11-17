@@ -190,7 +190,8 @@ def download_buttons(result: pd.DataFrame, level: str, template_file, key: str, 
         except ValueError as e:
             st.error(str(e))
         if "コントロールカラム" in upload.columns:
-            st.caption("コントロールカラムには、RMSのサンプルCSVと同じ n（登録）を入れています。d（削除）は出力しません。")
+            st.caption("コントロールカラム: レポートにある（登録済みの）行は u（CPC変更）、無い行は n（新規登録）。"
+                       "d（削除）は出力しません。")
         st.caption("⚠️ このCSVをExcelで開いて上書き保存しないでください。商品管理番号（13桁の数字など）が"
                    "「4.57E+12」のような形に変わり、正しく登録できなくなります。")
         st.dataframe(upload.head(50), use_container_width=True, hide_index=True)

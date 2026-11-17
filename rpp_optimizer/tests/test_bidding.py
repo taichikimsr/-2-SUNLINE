@@ -211,7 +211,9 @@ def test_rms_keyword_report_format():
     assert list(up.columns) == ["コントロールカラム", "商品管理番号", "キーワード", "キーワードCPC"]
     up = up.set_index("キーワード")
     assert up.loc["kw1", "キーワードCPC"] == r.loc["kw1", "推奨CPC"]
-    assert (up["コントロールカラム"] == "n").all()
+    assert (up["コントロールカラム"] == "u").all()  # レポートにある＝登録済み
+    new = build_upload(r.reset_index(), "keyword", df.iloc[:1], only_changed=False).set_index("キーワード")
+    assert new.loc["kw2", "コントロールカラム"] == "n"  # テンプレートに無い → 新規
 
 
 def test_upload_bytes_match_rms_sample_format():

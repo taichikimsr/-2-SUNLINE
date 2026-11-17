@@ -78,7 +78,8 @@ def build_upload(
         key = str(r["商品管理番号"])
         if kw_col:
             key += "\t" + str(r["キーワード"])
-        if key in existing.index:
+        registered = key in existing.index
+        if registered:
             row = existing.loc[key, tcols].to_dict()
         else:
             row = {c: "" for c in tcols}
@@ -86,8 +87,9 @@ def build_upload(
             if kw_col:
                 row[kw_col] = r["キーワード"]
         if ctrl_col:
-            # RMSのサンプルCSVでは n（登録）と d（削除）のみが使われているため n を入れる。d は出力しない
-            row[ctrl_col] = "n"
+            # レポート（テンプレート）にある＝登録済み → u（CPC変更）。無いもの → n（新規登録）。d（削除）は出力しない
+            # ※レポート上で「キーワードCPC」が空欄でも登録済みの場合がある（RMSで n を送ると「既に登録済」エラー）
+            row[ctrl_col] = "u" if registered else "n"
         row[cpc_col] = int(r["推奨CPC"])
         rows.append(row)
     out = pd.DataFrame(rows, columns=tcols)
