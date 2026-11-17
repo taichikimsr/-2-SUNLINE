@@ -97,3 +97,39 @@ def build_upload(
         # RMSのエラー結果CSVと同じ列（コントロールカラム・商品管理番号・(キーワード)・CPC）に絞る
         out = out[[c for c in (ctrl_col, id_col, kw_col, cpc_col) if c]]
     return out.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- 自動運用（アクションプラン）からの出力
+KW_UPLOAD_COLUMNS = ["コントロールカラム", "商品管理番号", "キーワード", "キーワードCPC"]
+
+
+def keyword_upload_from_actions(actions: pd.DataFrame) -> pd.DataFrame:
+    """キーワードCPCの一括アップロード用データ（RMSのサンプルと同じ4列）。
+
+    n: 新規登録 / u: CPC変更 / d: 削除（削除行のCPCは変更前の値を入れる。RMSのサンプルでも d 行にCPCがある）
+    """
+    a = actions[(actions["実行"]) & (actions["施策"].isin(["キーワード追加", "キーワードCPC変更", "キーワード削除"]))]
+    rows = []
+    for _, r in a.iterrows():
+        cpc = r["変更前CPC"] if r["施策"] == "キーワード削除" else r["変更後CPC"]
+        rows.append([r["コントロール"], r["商品管理番号"], r["キーワード"],
+                     "" if pd.isna(cpc) else int(cpc)])
+    return pd.DataFrame(rows, columns=KW_UPLOAD_COLUMNS)
+
+
+def item_upload_from_actions(actions: pd.DataFrame, report_columns=None) -> pd.DataFrame:
+    """商品CPCの一括アップロード用データ。
+
+    商品別レポートの列名（コントロールカラム・商品管理番号・商品CPC）に合わせる。
+    ※商品CPCの一括アップロード形式は、RMSのサンプルCSVで未確認。
+    """
+    cols = list(report_columns) if report_columns is not None else []
+    ctrl = next((c for c in cols if normalize_header(c) == "コントロールカラム"), "コントロールカラム")
+    id_col = next((c for c in cols if normalize_header(c) == "商品管理番号"), "商品管理番号")
+    cpc = next((c for c in cols if normalize_header(c) == "商品cpc"), None) or _find(
+        cols, "cpc", exclude=("実績", "平均", "目安", "キーワード")) or "商品CPC"
+    a = actions[(actions["実行"]) & (actions["施策"] == "商品CPC変更")]
+    return pd.DataFrame(
+        [[r["コントロール"], r["商品管理番号"], int(r["変更後CPC"])] for _, r in a.iterrows()],
+        columns=[ctrl, id_col, cpc],
+    )

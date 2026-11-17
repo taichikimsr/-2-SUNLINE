@@ -34,6 +34,9 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "price": ["販売価格", "価格"],
     "margin_rate": ["粗利率", "利益率"],
     "target_roas": ["目標roas"],
+    # RMS「検索キーワード」等の流入データ用
+    "access": ["アクセス人数", "アクセス数", "訪問者数", "セッション数", "流入数", "ユニークユーザー数"],
+    "conversion_rate": ["転換率", "cvr"],
 }
 
 FIELD_LABELS: Dict[str, str] = {
@@ -51,6 +54,8 @@ FIELD_LABELS: Dict[str, str] = {
     "price": "販売価格",
     "margin_rate": "粗利率(%)",
     "target_roas": "目標ROAS(%)",
+    "access": "アクセス数",
+    "conversion_rate": "転換率",
 }
 
 HEADER_HINTS = ("商品管理番号", "キーワード")
@@ -125,7 +130,74 @@ def read_csv_bytes(data: bytes) -> pd.DataFrame:
         if not any(c.strip() for c in row):
             continue  # 空行
         body.append((row + [""] * n)[:n])
-    return pd.DataFrame(body, columns=header, dtype=str)
+    df = pd.DataFrame(body, columns=header, dtype=str)
+    # ヘッダーより前の説明行（「集計単位: キーワード別」「集計期間: …」など）を保持
+    df.attrs["meta"] = [" ".join(c for c in r if c) for r in rows[:h] if any(c.strip() for c in r)]
+    return df
+
+
+_DATE_RANGE = re.compile(
+    r"(\d{4})[-/年]\s*(\d{1,2})[-/月]\s*(\d{1,2})日?\s*[-~～〜]\s*(\d{4})[-/年]\s*(\d{1,2})[-/月]\s*(\d{1,2})"
+)
+
+
+def report_period_days(df: pd.DataFrame) -> Optional[int]:
+    """説明行または「日付」列から集計期間の日数を求める（両端を含む）。分からなければ None。"""
+    from datetime import date
+
+    texts = list(df.attrs.get("meta", []))
+    for c in df.columns:
+        if "日付" in c or "期間" in c:
+            texts += df[c].astype(str).head(3).tolist()
+    for t in texts:
+        m = _DATE_RANGE.search(unicodedata.normalize("NFKC", t))
+        if m:
+            y1, m1, d1, y2, m2, d2 = map(int, m.groups())
+            try:
+                return (date(y2, m2, d2) - date(y1, m1, d1)).days + 1
+            except ValueError:
+                continue
+    return None
+
+
+def split_sales_columns(columns: Iterable[str], window: str = "720") -> Dict[str, Optional[str]]:
+    """新規・既存別の売上金額列を探す（例: 売上金額(新規720時間)）"""
+    cols = list(columns)
+    out: Dict[str, Optional[str]] = {"sales_new": None, "sales_existing": None}
+    for key, word in (("sales_new", "新規"), ("sales_existing", "既存")):
+        for c in cols:
+            n = normalize_header(c)
+            if "売上金額" in n and word in n and normalize_header(window) in n:
+                out[key] = c
+                break
+    return out
+
+
+def classify_dataset(df: pd.DataFrame) -> str:
+    """読み込んだCSVの種類を判定する。
+
+    keyword_report : RPPキーワード別レポート（商品管理番号＋キーワード＋クリック数）
+    item_report    : RPP商品別レポート（商品管理番号＋クリック数、キーワード列なし）
+    search_keywords: 検索キーワード等の流入データ（キーワード＋アクセス/売上、クリック数なし）
+    master         : 商品マスタ（商品管理番号＋粗利率/目標ROAS）
+    history        : 本ツールが出力した運用記録
+    unknown        : 判定できない
+    """
+    cols = list(df.columns)
+    norm = [normalize_header(c) for c in cols]
+    has = lambda w: any(normalize_header(w) in n for n in norm)  # noqa: E731
+    exact = lambda w: normalize_header(w) in norm  # noqa: E731
+    if exact("運用記録id") or (exact("施策") and exact("変更後cpc")):
+        return "history"
+    if has("商品管理番号") and exact("キーワード") and has("クリック数"):
+        return "keyword_report"
+    if has("商品管理番号") and has("クリック数"):
+        return "item_report"
+    if (exact("キーワード") or exact("検索キーワード")) and (has("アクセス") or has("売上") or has("訪問")):
+        return "search_keywords"
+    if has("商品管理番号") and (has("粗利率") or has("目標roas") or has("利益率")):
+        return "master"
+    return "unknown"
 
 
 def detect_column(columns: Iterable[str], field: str, prefer: Optional[str] = None) -> Optional[str]:

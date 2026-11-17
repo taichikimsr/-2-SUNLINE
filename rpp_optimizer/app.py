@@ -1,12 +1,15 @@
-"""楽天RPP広告 CPC最適化ツール（Streamlit）
+"""楽天RPP広告 自動運用ツール（Streamlit）
 
-使い方:
+起動:
+    py -m streamlit run app.py        （Windows）
     streamlit run rpp_optimizer/app.py
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
+import zipfile
 from datetime import datetime
 
 import pandas as pd
@@ -14,262 +17,310 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rpp.bidding import (  # noqa: E402
-    ColumnMap,
-    Settings,
-    attach_master,
-    item_vpc_map,
-    normalize_report,
-    recommend,
-    summarize,
+from rpp.datasets import (  # noqa: E402
+    LABELS, detect_kind, first_or_none, prepare_master, prepare_report, prepare_search_keywords,
 )
-from rpp.export import build_upload  # noqa: E402
-from rpp.io import FIELD_LABELS, detect_columns, read_csv_bytes, to_csv_bytes, to_number  # noqa: E402
+from rpp.export import item_upload_from_actions, keyword_upload_from_actions  # noqa: E402
+from rpp.io import read_csv_bytes, report_period_days, to_csv_bytes  # noqa: E402
+from rpp.strategy import (  # noqa: E402
+    CLS_DATA, CLS_GROW, CLS_KEEP, CLS_STRUCT, CLS_TUNE, ITEM_CPC, ITEM_EXCLUDE, KW_DELETE, KW_NEW, KW_UPDATE,
+    MODES, PAGE_FIX, Strategy, build_plan, history_records,
+)
 
-st.set_page_config(page_title="RPP CPC最適化ツール", page_icon="📈", layout="wide")
-st.title("📈 楽天RPP広告 CPC最適化ツール")
-st.caption("RMSからダウンロードしたRPPレポートをもとに、商品ごと・キーワードごとの推奨CPCを算出します。")
+st.set_page_config(page_title="RPP自動運用", page_icon="📈", layout="wide")
 
-with st.expander("📖 使い方", expanded=False):
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 1.5rem;}
+.kpi {border:1px solid rgba(128,128,128,.25); border-radius:10px; padding:12px 14px;}
+.kpi .l {font-size:.8rem; opacity:.7;}
+.kpi .v {font-size:1.5rem; font-weight:700;}
+.insight {border-left:4px solid #bf0000; padding:8px 12px; margin:6px 0; background:rgba(191,0,0,.05);}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title("📈 楽天RPP 自動運用")
+st.caption("RMSのレポートを入れるだけで、診断 → 入札・キーワードの追加/削除 → RMS一括アップロード用CSV までを自動で作成します。")
+
+# ================================================================ サイドバー：運用方針
+sb = st.sidebar
+sb.header("運用方針")
+margin = sb.number_input("粗利率（%）", 1.0, 95.0, 30.0, 1.0,
+                         help="販売価格から原価・送料・手数料を引いた利益の割合。目標ROASの基準になる最重要の設定です。"
+                              "商品ごとに違う場合は商品マスタCSVで指定できます。")
+mode = sb.radio("運用モード", list(MODES), index=1, horizontal=True,
+                help="利益重視: 目標ROAS＝損益分岐×1.3／バランス: ×1.1／売上拡大: ×0.9（新規キーワードも積極的に追加）")
+be = 100 / (margin / 100)
+sb.caption(f"損益分岐ROAS {be:.0f}% → 目標ROAS **{be * MODES[mode]['mult']:.0f}%**")
+existing_w = sb.slider("既存顧客の売上の評価", 0.0, 1.0, 1.0, 0.1,
+                       help="既存顧客は広告が無くても購入した可能性があります。0.5にすると既存顧客の売上を半分として評価し、"
+                            "新規顧客の獲得に強い入札になります（レポートに新規/既存の列がある場合のみ有効）。")
+event = sb.toggle("セール期間（スーパーSALE・お買い物マラソン等）", value=False,
+                  help="セール中は転換率が上がるため、成果の出ているキーワードの入札を上乗せします。終了後の運用で通常値に戻ります。")
+event_boost = sb.slider("セール時の上乗せ（%）", 5, 50, 20, 5, disabled=not event) / 100 if event else 0.0
+
+with sb.expander("詳細設定"):
+    window = st.radio("売上の計測期間", ["720", "12"], index=0, horizontal=True, format_func=lambda x: f"{x}時間")
+    min_kw = st.number_input("キーワードCPCの下限（円）", 1, 1000, 40)
+    min_item = st.number_input("商品CPCの下限（円）", 1, 1000, 20)
+    max_cpc = st.number_input("CPCの上限（円）", 10, 5000, 300, 10)
+    change = st.slider("1回の最大変更幅（%）", 5, 50, 25, 5) / 100
+    min_clicks = st.number_input("判定に必要なクリック数", 5, 500, 30, 5)
+    kw_cap = st.number_input("1商品あたりのキーワード上限", 1, 50, 20,
+                             help="2026年夏に10件→20件へ拡大されたとの情報があります。RMSで確認してください。")
+    new_per = st.number_input("1回で追加する新規キーワード（1商品あたり）", 0, 20, MODES[mode]["new_kw_per_item"])
+    new_max = st.number_input("新規キーワードのテストCPC上限（円）", 40, 1000, 80, 5)
+    del_ratio = st.slider("削除の基準（粗利1件分 × 倍率）", 0.5, 3.0, 1.0, 0.1,
+                          help="受注0件のまま、この金額以上を使ったキーワードを削除します。")
+    out_enc = st.radio("CSVの文字コード", ["cp932", "utf-8-sig"], horizontal=True,
+                       format_func=lambda x: "Shift_JIS（RMS用）" if x == "cp932" else "UTF-8")
+
+strategy = Strategy(
+    default_margin=margin, mode=mode, existing_weight=existing_w, event_boost=event_boost,
+    min_item_cpc=int(min_item), min_kw_cpc=int(min_kw), max_cpc=int(max_cpc), max_change_rate=change,
+    min_clicks=int(min_clicks), max_kw_per_item=int(kw_cap), new_kw_per_item=int(new_per),
+    new_kw_max_cpc=int(new_max), delete_ratio=del_ratio,
+)
+
+# ================================================================ データ投入
+st.subheader("1. データを入れる")
+st.markdown(
+    "RMSのCSVを**まとめて**ドラッグしてください。種類は自動で判定します。"
+    "　必須: **RPP キーワード別レポート**　推奨: **RPP 商品別レポート**（同じ期間）"
+    "　任意: 検索キーワードデータ／商品マスタ（商品管理番号・粗利率）／前回の運用記録"
+)
+files = st.file_uploader("CSVファイル", type=["csv"], accept_multiple_files=True, label_visibility="collapsed")
+
+loaded = []
+for f in files or []:
+    try:
+        df = read_csv_bytes(f.getvalue())
+        loaded.append({"name": f.name, "df": df, "kind": detect_kind(df)})
+    except Exception as e:  # noqa: BLE001
+        st.error(f"{f.name}: 読み込めませんでした（{e}）")
+
+if loaded:
+    kinds = list(LABELS)
+    cols = st.columns(min(len(loaded), 4))
+    for i, x in enumerate(loaded):
+        with cols[i % 4]:
+            x["kind"] = st.selectbox(x["name"], kinds, index=kinds.index(x["kind"]),
+                                     format_func=lambda k: LABELS[k], key=f"kind_{x['name']}")
+            if x["kind"] in ("item_report", "keyword_report"):
+                d = report_period_days(x["df"])
+                st.caption(f"{len(x['df'])}行・集計{d}日間" if d else f"{len(x['df'])}行")
+
+if not loaded:
+    with st.expander("📖 使い方・必要なデータ", expanded=True):
+        st.markdown(
+            """
+**毎週1回、同じ曜日に**次の流れで運用します。
+
+1. RMS → 広告 → RPP → パフォーマンスレポートで、集計期間を**直近30日**（大型セール期間は避ける）にして
+   - 集計単位「**キーワード別**」
+   - 集計単位「**商品別**」
+
+   をCSVでダウンロード
+2. 上の欄にまとめて入れる（前回このツールで保存した「運用記録CSV」も一緒に入れると、前回の施策の効果を自動で検証します）
+3. 「アクションプラン」を確認し、「出力」タブのCSVをRMSの一括アップロードで反映
+4. 「運用記録CSV」を保存（次回使います）
+
+**このツールが自動で判断すること**
+- 商品ごとの採算（損益分岐ROAS・必要CVR）と分類（拡大／維持／調整／構造的赤字／データ不足）
+- 登録済みキーワードのCPC変更・削除
+- 新しいキーワードの追加（商品名・他商品で売れた語・検索キーワードデータから候補を作り、採算が合うものだけテスト用CPCで追加）
+- 商品CPC（キーワード以外の配信）の調整と除外候補
+- 広告では解決できない商品のページ改善指示
+"""
+        )
+    st.stop()
+
+# ================================================================ 解析
+def pick(kind):
+    return [x["df"] for x in loaded if x["kind"] == kind]
+
+
+try:
+    item_raw = pick("item_report")
+    kw_raw = pick("keyword_report")
+    item_rep = first_or_none([prepare_report(d, "item", window) for d in item_raw])
+    kw_rep = first_or_none([prepare_report(d, "keyword", window) for d in kw_raw])
+    master = first_or_none([prepare_master(d) for d in pick("master")])
+    search_kw = first_or_none([prepare_search_keywords(d) for d in pick("search_keywords")])
+    history = first_or_none(pick("history"))
+    days = next((report_period_days(d) for d in kw_raw + item_raw if report_period_days(d)), None)
+    if item_rep is None and kw_rep is None:
+        st.warning("RPPの商品別またはキーワード別レポートを入れてください。")
+        st.stop()
+    plan = build_plan(item_rep, kw_rep, strategy, master=master, search_kw=search_kw, history=history,
+                      period_days=days)
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
+
+# ================================================================ 結果
+st.subheader("2. 診断とアクションプラン")
+tab_sum, tab_items, tab_plan, tab_cand, tab_fb, tab_out = st.tabs(
+    ["概要", "商品診断", "アクションプラン", "キーワード候補", "効果検証", "出力"]
+)
+
+
+def kpi(col, label, value):
+    col.markdown(f'<div class="kpi"><div class="l">{label}</div><div class="v">{value}</div></div>',
+                 unsafe_allow_html=True)
+
+
+s = plan.summary
+with tab_sum:
+    c = st.columns(5)
+    kpi(c[0], f"広告費（{int(s['集計日数']) if s['集計日数'] else '-'}日間）", f"{s['広告費']:,.0f}円")
+    kpi(c[1], "広告経由の売上", f"{s['売上']:,.0f}円")
+    kpi(c[2], "ROAS", "-" if pd.isna(s["ROAS(%)"]) else f"{s['ROAS(%)']:,.0f}%")
+    kpi(c[3], "粗利 − 広告費", f"{s['粗利-広告費']:,.0f}円")
+    kpi(c[4], "実行するアクション", f"{int(s['アクション数'])}件")
+
+    st.markdown("#### 所見")
+    items = plan.items
+    insights = []
+    target = float(items["目標ROAS(%)"].median())
+    if s["粗利-広告費"] < 0:
+        insights.append(f"期間中の広告は粗利ベースで <b>{-s['粗利-広告費']:,.0f}円の赤字</b> です"
+                        f"（粗利率{margin:.0f}%で計算。目標ROASは{target:.0f}%）。")
+    for _, it in items[items["分類"] == CLS_STRUCT].iterrows():
+        insights.append(
+            f"<b>{it['商品名'][:30]}…</b>：1クリックあたり売上 {it['1クリック売上']:.0f}円に対し、キーワードCPCの下限は{min_kw}円。"
+            f"CVR {it['CVR(%)']}% を <b>{it['必要CVR(%)']}%以上</b> に上げない限り、入札調整だけでは黒字になりません。"
+            "広告費を抑えつつ、商品ページの改善を優先してください。")
+    if s["削除対象の広告費"] > 0:
+        insights.append(f"受注につながっていないキーワードの削除で、期間中 <b>{s['削除対象の広告費']:,.0f}円</b> 相当の広告費を削減できます。")
+    if s["新規キーワード数"] > 0:
+        insights.append(f"新規キーワードを <b>{int(s['新規キーワード数'])}件</b> テスト追加します。次回の運用で成果を見て、継続・調整・削除を自動で判断します。")
+    grow = items[items["分類"] == CLS_GROW]
+    if not grow.empty:
+        insights.append(f"目標を上回っている商品が{len(grow)}件あります。入札を上げて露出を広げます。")
+    data_short = items[items["分類"] == CLS_DATA]
+    if not data_short.empty:
+        insights.append(f"クリックが{min_clicks}回未満でまだ判断できない商品が{len(data_short)}件あります。")
+    for n in plan.notes:
+        insights.append(n)
+    for t in insights:
+        st.markdown(f'<div class="insight">{t}</div>', unsafe_allow_html=True)
+
+    st.markdown("#### 施策の内訳")
+    cnt = plan.actions.groupby("施策")["実行"].agg(["count", "sum"]).rename(columns={"count": "件数", "sum": "うち自動実行"})
+    st.dataframe(cnt, use_container_width=True)
+
+with tab_items:
+    order = {CLS_STRUCT: 0, CLS_TUNE: 1, CLS_GROW: 2, CLS_KEEP: 3, CLS_DATA: 4}
+    view = plan.items.sort_values("分類", key=lambda x: x.map(order))
+    cols = ["分類", "商品管理番号", "商品名", "クリック数", "実績額", "売上金額", "売上件数", "ROAS(%)", "見込みROAS(%)",
+            "目標ROAS(%)", "CVR(%)", "必要CVR(%)", "客単価", "1クリック売上", "目標CPC", "粗利-広告費",
+            "KW外クリック", "KW外ROAS(%)"]
+    st.dataframe(view[[c for c in cols if c in view.columns]], use_container_width=True, hide_index=True)
+    st.caption("見込みROAS: クリックの少ない商品を店舗平均に寄せて補正した値。必要CVR: キーワード下限CPCで目標ROASを満たすのに必要な転換率。"
+               "KW外: 登録キーワード以外の検索から来たクリック（商品CPCで配信される部分）。")
+    if not plan.keywords.empty:
+        st.markdown("#### 登録済みキーワード")
+        kcols = ["判定", "商品管理番号", "キーワード", "クリック数", "実績額", "売上金額", "売上件数", "見込みROAS(%)",
+                 "目標ROAS(%)", "目安CPC", "CPC実績", "目標CPC", "根拠"]
+        st.dataframe(plan.keywords[[c for c in kcols if c in plan.keywords.columns]], use_container_width=True,
+                     hide_index=True)
+
+with tab_plan:
+    st.caption("「実行」のチェックを外すと出力されません。変更後CPCは直接編集できます。"
+               "ページ改善・除外候補・受注のあるキーワードの削除は、人の判断が必要なため初期状態はチェックなしです。")
+    kinds = st.multiselect("表示する施策", [KW_UPDATE, KW_NEW, KW_DELETE, ITEM_CPC, ITEM_EXCLUDE, PAGE_FIX],
+                           default=[KW_UPDATE, KW_NEW, KW_DELETE, ITEM_CPC, ITEM_EXCLUDE, PAGE_FIX])
+    shown = plan.actions[plan.actions["施策"].isin(kinds)]
+    edited = st.data_editor(
+        shown, use_container_width=True, hide_index=True, key="plan_editor",
+        disabled=[c for c in shown.columns if c not in ("実行", "変更後CPC")],
+        column_config={
+            "実行": st.column_config.CheckboxColumn("実行"),
+            "変更後CPC": st.column_config.NumberColumn("変更後CPC", min_value=1, step=1, format="%d"),
+            "変更前CPC": st.column_config.NumberColumn(format="%d"),
+            "根拠": st.column_config.TextColumn(width="large"),
+        },
+    )
+    actions = plan.actions.copy()
+    actions.loc[edited.index, ["実行", "変更後CPC"]] = edited[["実行", "変更後CPC"]]
+
+with tab_cand:
+    if plan.candidates.empty:
+        st.info("新規キーワードの候補はありません。")
+    else:
+        st.caption("候補の作り方: ①検索キーワードデータ（実際の流入がある語）②他商品で売れた語の横展開 ③商品名の語の組み合わせ。"
+                   "採算CPC＝想定1クリック売上÷目標ROAS。下限CPCに届かない候補は、追加すると赤字になるため見送ります。")
+        st.dataframe(plan.candidates, use_container_width=True, hide_index=True)
+
+with tab_fb:
+    if plan.feedback.empty:
+        st.info("前回の運用記録CSVを一緒に入れると、前回変更したキーワードの成果（クリック/日・ROASの変化）をここに表示し、"
+                "下げすぎで露出が落ちたキーワードは自動で戻します。")
+    else:
+        st.dataframe(plan.feedback, use_container_width=True, hide_index=True)
+
+with tab_out:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    kw_up = keyword_upload_from_actions(actions)
+    item_cols = item_raw[0].columns if item_raw else None
+    item_up = item_upload_from_actions(actions, item_cols)
+    record = history_records(plan.__class__(**{**plan.__dict__, "actions": actions}), days)
+
+    def csv_bytes(df, upload=False):
+        return to_csv_bytes(df, out_enc, lineterminator="\n" if upload else "\r\n")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"##### キーワードCPC（{len(kw_up)}行）")
+        n_cnt = (kw_up["コントロールカラム"] == "n").sum()
+        u_cnt = (kw_up["コントロールカラム"] == "u").sum()
+        d_cnt = (kw_up["コントロールカラム"] == "d").sum()
+        st.caption(f"n 新規登録 {n_cnt}件 ／ u CPC変更 {u_cnt}件 ／ d 削除 {d_cnt}件")
+        if len(kw_up):
+            st.download_button("⬇️ キーワードCPC 一括アップロード用CSV", csv_bytes(kw_up, True),
+                               f"rpp_keyword_upload_{stamp}.csv", "text/csv", use_container_width=True)
+            st.dataframe(kw_up, use_container_width=True, hide_index=True, height=240)
+    with c2:
+        st.markdown(f"##### 商品CPC（{len(item_up)}行）")
+        if not item_raw:
+            st.caption("商品別レポートを入れると、商品CPCの調整も出力します。")
+        elif len(item_up):
+            st.caption("⚠️ 商品CPCの一括アップロード形式は、RMSのサンプルでまだ確認できていません。"
+                       "エラーが出た場合は、RMSの「商品CPCの登録/更新」のサンプルCSVを送ってください。")
+            st.download_button("⬇️ 商品CPC 一括アップロード用CSV", csv_bytes(item_up, True),
+                               f"rpp_item_upload_{stamp}.csv", "text/csv", use_container_width=True)
+            st.dataframe(item_up, use_container_width=True, hide_index=True, height=240)
+
+    st.markdown("##### 運用記録（次回、レポートと一緒に読み込んでください）")
+    st.download_button("⬇️ 運用記録CSV", to_csv_bytes(record, "utf-8-sig"), f"rpp_運用記録_{stamp}.csv", "text/csv")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if len(kw_up):
+            z.writestr(f"rpp_keyword_upload_{stamp}.csv", csv_bytes(kw_up, True))
+        if len(item_up):
+            z.writestr(f"rpp_item_upload_{stamp}.csv", csv_bytes(item_up, True))
+        z.writestr(f"rpp_運用記録_{stamp}.csv", to_csv_bytes(record, "utf-8-sig"))
+        z.writestr(f"rpp_アクションプラン_{stamp}.csv", to_csv_bytes(actions, "utf-8-sig"))
+        z.writestr(f"rpp_商品診断_{stamp}.csv", to_csv_bytes(plan.items.drop(columns=["_source"], errors="ignore"), "utf-8-sig"))
+        if not plan.candidates.empty:
+            z.writestr(f"rpp_キーワード候補_{stamp}.csv", to_csv_bytes(plan.candidates, "utf-8-sig"))
+    st.download_button("📦 すべてまとめてダウンロード（ZIP）", buf.getvalue(), f"rpp_運用_{stamp}.zip",
+                       "application/zip", type="primary")
+
     st.markdown(
         """
-1. RMS「広告・アフィリエイト・楽天大学」→「広告（プロモーションメニュー）」→ RPP のパフォーマンスレポートから、
-   **商品別レポート** と（必要に応じて）**キーワード別レポート** をCSVでダウンロードします。
-   - 集計期間は直近14〜30日程度を推奨します（短すぎると判定できる商品が少なくなります）。
-2. 左のサイドバーで目標ROASや下限CPCなどを設定します。
-3. CSVをアップロードし、列の対応が正しいか確認します。
-4. 推奨CPCを確認・必要に応じて手修正し、一括アップロード用CSVをダウンロードします。
-5. RMSのRPP「商品・キーワード設定」から一括アップロードで反映します。
+**RMSへの反映**
+1. RMS → 広告 → RPP →「商品・キーワード設定」→「一括アップロード」
+2. キーワードは「**キーワードCPCの登録/更新**」、商品は「**商品CPCの登録/更新**」を選び、上のCSVをそのままアップロード
+3. エラー結果CSVが返ってきた場合は、内容を確認（よくある例：「既に登録済」→ そのキーワードの n を u に変更）
 
-**注意**
-- 楽天はRPPの入札を変更する公開APIを提供していないため（2026年11月時点で確認できた範囲）、本ツールは自動反映を行いません。
-- 下限CPC・CSVの列構成は楽天の仕様変更で変わることがあります。必ずRMS画面の最新の表示・サンプルフォーマットと照合してください。
-- 売上金額は12時間・720時間など計測期間の違う列があります。どちらを使うかサイドバーで選んでください。
+⚠️ アップロード用CSVは **Excelで開いて上書き保存しない** でください。商品管理番号が「4.57E+12」の形に変わり、正しく登録できなくなります。
 """
     )
 
-# ---------------- サイドバー: 設定 ----------------
-sb = st.sidebar
-sb.header("⚙️ 運用方針")
-target_roas = sb.number_input("目標ROAS（%）", min_value=50.0, max_value=5000.0, value=400.0, step=50.0,
-                              help="売上金額 ÷ 広告費 × 100。この値を満たせる範囲で最大のCPCを推奨します。")
-margin_mode = sb.checkbox("商品マスタの粗利率から目標ROASを自動算出", value=False,
-                          help="損益分岐ROAS ＝ 100 ÷ 粗利率。これに下の係数を掛けた値を目標にします。")
-margin_safety = sb.number_input("損益分岐ROASに掛ける係数", min_value=1.0, max_value=5.0, value=1.2, step=0.1,
-                                disabled=not margin_mode)
-
-sb.header("💴 CPCの範囲")
-min_item_cpc = sb.number_input("商品CPCの下限（円）", min_value=1, value=20, step=1,
-                               help="2025年の仕様変更で10円→20円になったとの情報があります。RMSで最新の値を確認してください。")
-min_kw_cpc = sb.number_input("キーワードCPCの下限（円）", min_value=1, value=40, step=1)
-max_cpc = sb.number_input("自社の上限CPC（円）", min_value=1, value=300, step=10)
-max_change = sb.slider("1回あたりの最大変更幅（±%）", 5, 100, 20, 5) / 100
-
-sb.header("📊 判定基準")
-window = sb.radio("売上の計測期間", ["720時間", "12時間"], index=0, horizontal=True,
-                  help="レポートの「売上金額(合計720時間)」などの列を自動で選びます。")
-min_clicks = sb.number_input("判定に必要な最低クリック数", min_value=1, value=30, step=5)
-prior_clicks = sb.number_input("平滑化の強さ（仮想クリック数）", min_value=0.0, value=30.0, step=5.0,
-                               help="クリックが少ない商品の実績を平均値に寄せる度合い。大きいほど慎重になります。")
-no_sale_limit = sb.number_input("売上0円で引き下げる広告費の基準（円）", min_value=0, value=3000, step=500)
-keep_band = sb.slider("据え置きとする差の幅（±%）", 0, 30, 5) / 100
-explore = sb.slider("データ不足時に試験的に上げる幅（%）", 0, 30, 0) / 100
-
-settings = Settings(
-    target_roas_pct=target_roas,
-    min_item_cpc=int(min_item_cpc),
-    min_keyword_cpc=int(min_kw_cpc),
-    max_cpc=int(max_cpc),
-    max_change_rate=max_change,
-    min_clicks=int(min_clicks),
-    prior_clicks=float(prior_clicks),
-    no_sale_spend_limit=float(no_sale_limit),
-    keep_band=keep_band,
-    margin_mode=margin_mode,
-    margin_safety=margin_safety,
-    explore_rate=explore,
-)
-
-sb.header("📤 出力")
-out_encoding = sb.radio("出力文字コード", ["cp932", "utf-8-sig"], index=0, horizontal=True,
-                        format_func=lambda x: "Shift_JIS" if x == "cp932" else "UTF-8(BOM付)")
-only_changed = sb.checkbox("変更がある行だけ出力", value=True)
-include_review = sb.checkbox("「要確認」の行も下限CPCで出力", value=False)
-
-
-# ---------------- 共通関数 ----------------
-def load(uploaded):
-    if uploaded is None:
-        return None
-    try:
-        return read_csv_bytes(uploaded.getvalue())
-    except Exception as e:  # noqa: BLE001
-        st.error(f"{uploaded.name} を読み込めませんでした: {e}")
-        return None
-
-
-def column_selector(df: pd.DataFrame, fields, key: str) -> ColumnMap:
-    detected = detect_columns(df.columns, prefer_window=window.replace("時間", ""))
-    options = ["（なし）"] + list(df.columns)
-    cols = st.columns(4)
-    chosen = {}
-    for i, f in enumerate(fields):
-        default = detected.get(f)
-        idx = options.index(default) if default in options else 0
-        sel = cols[i % 4].selectbox(FIELD_LABELS[f], options, index=idx, key=f"{key}_{f}")
-        chosen[f] = None if sel == "（なし）" else sel
-    return ColumnMap.from_dict(chosen)
-
-
-def show_summary(result: pd.DataFrame):
-    s = summarize(result)
-    c = st.columns(6)
-    c[0].metric("対象数", f"{s['件数']:,}")
-    c[1].metric("広告費", f"{s['広告費']:,.0f}円")
-    c[2].metric("売上", f"{s['売上']:,.0f}円")
-    c[3].metric("ROAS", "-" if pd.isna(s["ROAS(%)"]) else f"{s['ROAS(%)']:,.0f}%")
-    c[4].metric("引き上げ / 引き下げ", f"{s['引き上げ']} / {s['引き下げ']}")
-    c[5].metric("要確認", f"{s['要確認']}")
-
-
-DISPLAY_COLS_ITEM = ["商品管理番号", "商品名", "クリック数", "実績額", "売上金額", "売上件数", "ROAS(%)", "見込みROAS(%)",
-                     "CVR(%)", "目標ROAS(%)", "目安CPC", "基準CPC", "基準CPCの出所", "理論上限CPC", "推奨CPC", "変更額",
-                     "判定", "理由"]
-DISPLAY_COLS_KW = DISPLAY_COLS_ITEM[:1] + ["キーワード"] + DISPLAY_COLS_ITEM[1:]
-
-
-def result_editor(result: pd.DataFrame, level: str, key: str) -> pd.DataFrame:
-    cols = DISPLAY_COLS_KW if level == "keyword" else DISPLAY_COLS_ITEM
-    cols = [c for c in cols if c in result.columns]
-    judge_filter = st.multiselect("判定で絞り込み", sorted(result["判定"].unique()), key=f"{key}_filter")
-    view = result if not judge_filter else result[result["判定"].isin(judge_filter)]
-    edited = st.data_editor(
-        view[cols],
-        use_container_width=True,
-        hide_index=True,
-        disabled=[c for c in cols if c != "推奨CPC"],
-        column_config={
-            "推奨CPC": st.column_config.NumberColumn("推奨CPC（編集可）", min_value=1, step=1, format="%d"),
-            "実績額": st.column_config.NumberColumn(format="%d"),
-            "売上金額": st.column_config.NumberColumn(format="%d"),
-        },
-        key=f"{key}_editor",
-    )
-    # 手修正を反映
-    merged = result.copy()
-    merged.loc[edited.index, "推奨CPC"] = edited["推奨CPC"].astype(int)
-    merged["変更額"] = merged["推奨CPC"] - merged["基準CPC"].round().astype(int)
-    return merged
-
-
-def download_buttons(result: pd.DataFrame, level: str, template_file, key: str, report_df=None):
-    label = "キーワード" if level == "keyword" else "商品"
-    template = load(template_file) if template_file is not None else None
-    if template is None and report_df is not None:
-        # RMSのRPPレポートは説明行を消せばそのまま一括設定に使える形式のため、レポート自体をテンプレートにする
-        template = report_df
-        st.caption("テンプレート未指定のため、読み込んだレポートの列名で出力します。")
-    try:
-        upload = build_upload(result, level, template, only_changed, include_review)
-    except ValueError as e:
-        st.error(str(e))
-        return
-    min_cpc = settings.min_keyword_cpc if level == "keyword" else settings.min_item_cpc
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"**一括アップロード用CSV（{len(upload)}行）**")
-        cpc_col = [c for c in upload.columns if "cpc" in c.lower()]
-        if cpc_col and len(upload) and (to_number(upload[cpc_col[0]]) < min_cpc).any():
-            st.warning(f"下限CPC（{min_cpc}円）未満の値があります。")
-        try:
-            data = to_csv_bytes(upload, out_encoding, lineterminator="\n")
-            st.download_button(f"⬇️ {label}CPC 一括アップロード用CSV", data,
-                               file_name=f"rpp_{level}_cpc_upload_{stamp}.csv", mime="text/csv",
-                               key=f"{key}_dl_up", use_container_width=True)
-        except ValueError as e:
-            st.error(str(e))
-        if "コントロールカラム" in upload.columns:
-            st.caption("コントロールカラム: レポートにある（登録済みの）行は u（CPC変更）、無い行は n（新規登録）。"
-                       "d（削除）は出力しません。")
-        st.caption("⚠️ このCSVをExcelで開いて上書き保存しないでください。商品管理番号（13桁の数字など）が"
-                   "「4.57E+12」のような形に変わり、正しく登録できなくなります。")
-        st.dataframe(upload.head(50), use_container_width=True, hide_index=True)
-    with c2:
-        st.markdown("**分析結果（記録用・Excelで開けるUTF-8）**")
-        st.download_button(f"⬇️ {label}別 分析結果CSV", to_csv_bytes(result, "utf-8-sig"),
-                           file_name=f"rpp_{level}_analysis_{stamp}.csv", mime="text/csv",
-                           key=f"{key}_dl_an", use_container_width=True)
-        st.caption("変更の履歴として保存しておくと、次回の効果検証に使えます。")
-
-
-# ---------------- 商品マスタ ----------------
-st.subheader("① 商品マスタ（任意）")
-st.caption("列: 商品管理番号, 粗利率（%）, 目標ROAS（%）。粗利率または目標ROASを商品ごとに変えたい場合のみ使います。")
-master_file = st.file_uploader("商品マスタCSV", type=["csv"], key="master")
-master = None
-mdf = load(master_file)
-if mdf is not None:
-    det = detect_columns(mdf.columns)
-    if not det["item_id"]:
-        st.error("商品マスタに「商品管理番号」列が見つかりません。")
-    else:
-        master = pd.DataFrame({"商品管理番号": mdf[det["item_id"]]})
-        if det["margin_rate"]:
-            master["粗利率"] = to_number(mdf[det["margin_rate"]])
-        if det["target_roas"]:
-            master["目標ROAS"] = to_number(mdf[det["target_roas"]])
-        st.success(f"{len(master)}件の商品マスタを読み込みました。")
-
-# ---------------- 商品別 ----------------
-st.subheader("② 商品CPC")
-item_file = st.file_uploader("RPP 商品別レポートCSV", type=["csv"], key="item")
-item_template = st.file_uploader("（任意）RMSの商品CPC一括アップロード用サンプル／現在設定CSV", type=["csv"],
-                                 key="item_tmpl",
-                                 help="読み込むと、その列構成のままCPC列だけを書き換えて出力します。")
-item_result = None
-idf = load(item_file)
-if idf is not None:
-    with st.expander("列の対応（自動判定・変更可）", expanded=False):
-        cmap = column_selector(idf, ["item_id", "item_name", "clicks", "spend", "sales", "orders",
-                                     "current_cpc", "guide_cpc", "actual_cpc"], "item")
-    if detect_columns(idf.columns).get("keyword") == "キーワード":
-        st.error("このファイルは「キーワード別」レポートのため、②では計算しません。"
-                 "下の③に読み込んでください。②には集計単位「商品別」のレポートを読み込みます。")
-    else:
-        try:
-            rep = attach_master(normalize_report(idf, cmap, "item"), master)
-            item_result = recommend(rep, settings, "item")
-            show_summary(item_result)
-            item_result = result_editor(item_result, "item", "item")
-            download_buttons(item_result, "item", item_template, "item", idf)
-        except ValueError as e:
-            st.error(str(e))
-
-# ---------------- キーワード別 ----------------
-st.subheader("③ キーワードCPC")
-st.caption("商品別レポートも読み込んでいる場合、クリックの少ないキーワードは商品全体の実績を基準に補正します。")
-kw_file = st.file_uploader("RPP キーワード別レポートCSV", type=["csv"], key="kw")
-kw_template = st.file_uploader("（任意）RMSのキーワード一括アップロード用サンプル／現在設定CSV", type=["csv"],
-                               key="kw_tmpl")
-kdf = load(kw_file)
-if kdf is not None:
-    with st.expander("列の対応（自動判定・変更可）", expanded=False):
-        kmap = column_selector(kdf, ["item_id", "keyword", "item_name", "clicks", "spend", "sales", "orders",
-                                     "current_cpc", "guide_cpc", "actual_cpc"], "kw")
-    try:
-        rep = attach_master(normalize_report(kdf, kmap, "keyword"), master)
-        if item_result is not None:
-            names = dict(zip(item_result["商品管理番号"], item_result["商品名"]))
-            blank = rep["商品名"].fillna("").astype(str).str.strip().isin(["", "nan"])
-            rep.loc[blank, "商品名"] = rep.loc[blank, "商品管理番号"].map(names).fillna("")
-        prior = item_vpc_map(item_result) if item_result is not None else None
-        kw_result = recommend(rep, settings, "keyword", prior_vpc=prior)
-        show_summary(kw_result)
-        kw_result = result_editor(kw_result, "keyword", "kw")
-        download_buttons(kw_result, "keyword", kw_template, "kw", kdf)
-    except ValueError as e:
-        st.error(str(e))
-
-st.markdown("---")
-st.caption("RPP CPC最適化ツール v0.1 | SUNLINE合同会社")
+st.caption("RPP自動運用ツール v0.3 | SUNLINE合同会社")
