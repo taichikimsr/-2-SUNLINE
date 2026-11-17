@@ -207,8 +207,9 @@ def test_rms_keyword_report_format():
     assert r.loc["kw1", "基準CPCの出所"] == "CPC実績"  # キーワードCPC未設定
     assert r.loc["kw2", "基準CPCの出所"] == "設定CPC"
     # レポート自体をテンプレートにして出力 → 「キーワードCPC」列に書き込み、「目安CPC」は変更しない
-    up = build_upload(r.reset_index(), "keyword", df)
-    assert list(up.columns) == list(df.columns)
-    row = up.set_index("キーワード").loc["kw1"]
-    assert row["キーワードCPC"] == r.loc["kw1", "推奨CPC"]
-    assert row["目安CPC"] == "40"
+    up = build_upload(r.reset_index(), "keyword", df, only_changed=False)
+    assert list(up.columns) == ["コントロールカラム", "商品管理番号", "キーワード", "キーワードCPC"]
+    up = up.set_index("キーワード")
+    assert up.loc["kw1", "キーワードCPC"] == r.loc["kw1", "推奨CPC"]
+    assert up.loc["kw1", "コントロールカラム"] == "n"  # キーワードCPC未設定 → 新規登録
+    assert up.loc["kw2", "コントロールカラム"] == "u"  # 設定済み → 変更

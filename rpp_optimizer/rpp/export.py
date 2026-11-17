@@ -71,6 +71,8 @@ def build_upload(
         tmpl["_key"] += "\t" + tmpl[kw_col].astype(str).str.strip()
     existing = tmpl.drop_duplicates("_key", keep="last").set_index("_key")
 
+    ctrl_col = _find(tcols, "コントロールカラム")
+
     rows = []
     for _, r in df.iterrows():
         key = str(r["商品管理番号"])
@@ -83,6 +85,13 @@ def build_upload(
             row[id_col] = r["商品管理番号"]
             if kw_col:
                 row[kw_col] = r["キーワード"]
+        if ctrl_col:
+            # 既にCPCが設定されていれば u（変更）、未設定なら n（新規登録）。d（削除）は出力しない
+            row[ctrl_col] = "u" if str(row.get(cpc_col, "")).strip() not in ("", "-", "nan") else "n"
         row[cpc_col] = int(r["推奨CPC"])
         rows.append(row)
-    return pd.DataFrame(rows, columns=tcols)
+    out = pd.DataFrame(rows, columns=tcols)
+    if ctrl_col:
+        # RMSのエラー結果CSVと同じ列（コントロールカラム・商品管理番号・(キーワード)・CPC）に絞る
+        out = out[[c for c in (ctrl_col, id_col, kw_col, cpc_col) if c]]
+    return out.reset_index(drop=True)

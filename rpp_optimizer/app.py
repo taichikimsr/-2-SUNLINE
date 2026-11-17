@@ -168,7 +168,7 @@ def download_buttons(result: pd.DataFrame, level: str, template_file, key: str, 
     if template is None and report_df is not None:
         # RMSのRPPレポートは説明行を消せばそのまま一括設定に使える形式のため、レポート自体をテンプレートにする
         template = report_df
-        st.caption("テンプレート未指定のため、読み込んだレポートと同じ列構成で出力します（先頭の説明行は除外済み）。")
+        st.caption("テンプレート未指定のため、読み込んだレポートの列名で出力します。")
     try:
         upload = build_upload(result, level, template, only_changed, include_review)
     except ValueError as e:
@@ -189,6 +189,11 @@ def download_buttons(result: pd.DataFrame, level: str, template_file, key: str, 
                                key=f"{key}_dl_up", use_container_width=True)
         except ValueError as e:
             st.error(str(e))
+        if "コントロールカラム" in upload.columns:
+            st.caption("コントロールカラム: CPC設定済みの行は u（変更）、未設定の行は n（新規登録）を自動で入れています。"
+                       "d（削除）は出力しません。")
+        st.caption("⚠️ このCSVをExcelで開いて上書き保存しないでください。商品管理番号（13桁の数字など）が"
+                   "「4.57E+12」のような形に変わり、正しく登録できなくなります。")
         st.dataframe(upload.head(50), use_container_width=True, hide_index=True)
     with c2:
         st.markdown("**分析結果（記録用・Excelで開けるUTF-8）**")
