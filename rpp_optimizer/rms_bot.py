@@ -20,7 +20,7 @@ RMSの画面操作（どのボタンを押すか）は、まだ記録できて�
     py -m pip install playwright
     （ブラウザはPCに入っている Google Chrome または Microsoft Edge を使うため、
       「py -m playwright install chromium」は不要）
-    py rms_bot.py login     … ブラウザが開くので手動でログイン（「信頼できる端末」に登録すると14日間コード不要）
+    py rms_bot.py login     … ツール専用の普通のChromeが開くので手動でログイン（「信頼できる端末」に登録すると14日間コード不要）
     py rms_bot.py check     … ログイン状態の確認
     py rms_bot.py record    … RMSでの操作を記録（レポートのダウンロード・一括アップロード・月予算の変更）
     py rms_bot.py run       … 運用を1回実行（CSVの作成まで）
@@ -59,40 +59,77 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
-# PCに入っているブラウザを優先して使う（Playwright専用ブラウザのダウンロードを不要にするため）
-CHANNELS = ("chrome", "msedge", None)  # None = Playwright専用のChromium（py -m playwright install chromium が必要）
+# ---------------------------------------------------------------- ブラウザ
+# RMSへのログインは、自動操作用ではない「普通のChrome/Edge」で行う。
+#   - 自動操作用に起動したブラウザは「自動テストソフトウェアによって制御されています」と表示され、
+#     シークレットウィンドウのような空の状態で始まるため、ログインが通りにくい場合がある
+#   - そこで、ツール専用のプロフィール（.rms_profile）で普通のChromeを起動し、人が通常どおりログインする
+#   - ツールは、そのChromeに後からつないで操作する（Chromeのリモートデバッグ機能。このPCの中だけで通信）
+CDP_PORT = 9333
+BROWSER_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+]
 
 
-def _browser(p, headless: bool):
-    last = None
-    for ch in CHANNELS:
-        try:
-            kw = {"channel": ch} if ch else {}
-            return p.chromium.launch_persistent_context(PROFILE_DIR, headless=headless, accept_downloads=True,
-                                                        locale="ja-JP", viewport={"width": 1400, "height": 900}, **kw)
-        except Exception as e:  # noqa: BLE001  そのブラウザが無ければ次を試す
-            last = e
-    raise RuntimeError("Google Chrome も Microsoft Edge も起動できませんでした。どちらかをインストールしてください。"
-                       f"（詳細: {last}）")
-
-
-def _installed_channel() -> str:
-    """codegen（操作の記録）に使うブラウザ"""
+def _browser_exe() -> str:
     import shutil
 
-    candidates = {
-        "chrome": [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                   r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                   os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-                   "/Applications/Google Chrome.app"],
-        "msedge": [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                   r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                   "/Applications/Microsoft Edge.app"],
-    }
-    for ch, paths in candidates.items():
-        if any(os.path.exists(x) for x in paths) or shutil.which(ch):
-            return ch
+    if os.environ.get("RMS_BOT_BROWSER"):
+        return os.environ["RMS_BOT_BROWSER"]
+    for x in BROWSER_CANDIDATES:
+        if os.path.exists(x):
+            return x
+    for name in ("chrome", "google-chrome", "msedge", "microsoft-edge"):
+        if shutil.which(name):
+            return shutil.which(name)
     return ""
+
+
+def _cdp_alive() -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def open_normal_browser(url: str) -> None:
+    """ツール専用プロフィールで普通のChrome/Edgeを起動する（既に起動していれば何もしない）"""
+    import time
+
+    if _cdp_alive():
+        return
+    exe = _browser_exe()
+    if not exe:
+        raise RuntimeError("Google Chrome も Microsoft Edge も見つかりません。どちらかをインストールしてください。")
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    args = [exe, f"--remote-debugging-port={CDP_PORT}", "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={PROFILE_DIR}", "--no-first-run", "--no-default-browser-check"]
+    if os.environ.get("RMS_BOT_HEADLESS"):  # テスト用
+        args += ["--headless=new", "--no-sandbox"]
+    subprocess.Popen(args + [url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):
+        if _cdp_alive():
+            return
+        time.sleep(0.5)
+    raise RuntimeError("ブラウザを起動できませんでした。開いている「RMS用」のChromeウィンドウをすべて閉じてから、もう一度実行してください。")
+
+
+def connect(p, url: str = None):
+    """専用プロフィールのChromeにつなぐ。戻り値: (context, page)"""
+    open_normal_browser(url or RMS_MAIN_URL)
+    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    return ctx, page
 
 
 def is_logged_in(page) -> bool:
@@ -105,15 +142,17 @@ def is_logged_in(page) -> bool:
 def cmd_login(_args) -> int:
     from playwright.sync_api import sync_playwright
 
+    # ログイン中はツールをつながず、普通のブラウザとして人が操作する
+    open_normal_browser(RMS_LOGIN_URL)
+    print("開いたChrome（またはEdge）で、普段どおりRMSにログインしてください。")
+    print("  ・R-Login ID／楽天会員ID／パスワードは、このブラウザの画面に入力します（この黒い画面には入力しません）")
+    print("  ・Viberの認証コードを入力し、「信頼できる端末」に登録すると14日間はコード不要になります")
+    input("RMSのメインメニューが表示されたら、この画面で Enter を押してください … ")
     with sync_playwright() as p:
-        ctx = _browser(p, headless=False)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto(RMS_LOGIN_URL)
-        print("ブラウザでRMSにログインしてください（Viberの認証コード入力、「信頼できる端末」への登録まで）。")
-        input("RMSのメインメニューが表示されたら、この画面で Enter を押してください … ")
+        _, page = connect(p)
         ok = is_logged_in(page)
-        ctx.close()
-    log("ログイン状態を保存しました" if ok else "ログインを確認できませんでした。もう一度 login を実行してください")
+    log("ログインを確認しました。このChromeのウィンドウは開いたままで構いません"
+        if ok else "ログインを確認できませんでした。ブラウザでログインしてから、もう一度 login を実行してください")
     return 0 if ok else 1
 
 
@@ -121,10 +160,8 @@ def cmd_check(_args) -> int:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        ctx = _browser(p, headless=False)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        _, page = connect(p)
         ok = is_logged_in(page)
-        ctx.close()
     log("ログイン中です" if ok else "ログインが切れています。py rms_bot.py login で再ログインしてください")
     return 0 if ok else 2
 
@@ -137,11 +174,15 @@ def cmd_record(_args) -> int:
     print("  4. キャンペーン設定で月予算を変更する画面を開く（保存はしなくて構いません）")
     print(f"終わったらブラウザを閉じてください。操作は {RECORD_PATH} に保存されます。")
     print("※パスワードを入力した場合は記録に残るため、記録はログイン後の画面から始めてください。")
+    if _cdp_alive():
+        input("先に、login で開いたChromeのウィンドウをすべて閉じてから Enter を押してください … ")
     cmd = [sys.executable, "-m", "playwright", "codegen", "--target", "python",
            "--user-data-dir", PROFILE_DIR, "-o", RECORD_PATH]
-    ch = _installed_channel()
-    if ch:
-        cmd += ["--channel", ch]
+    exe = _browser_exe().lower()
+    if "msedge" in exe or "microsoft edge" in exe:
+        cmd += ["--channel", "msedge"]
+    elif exe:
+        cmd += ["--channel", "chrome"]
     return subprocess.call(cmd + [RMS_MAIN_URL])
 
 
@@ -166,14 +207,11 @@ def cmd_run(args) -> int:
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as p:
-                ctx = _browser(p, headless=False)
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                _, page = connect(p)
                 if not is_logged_in(page):
-                    ctx.close()
                     log("ログインが切れているため中止しました。py rms_bot.py login で再ログインしてください")
                     return 2
                 rms_steps.download_reports(page, inbox)
-                ctx.close()
         except NotImplementedError as e:
             log(f"レポートの自動ダウンロードは未対応です: {e}")
             log(f"RMSからダウンロードしたCSVを {inbox} に置き、py rms_bot.py run --input \"{inbox}\" で実行してください")
@@ -198,14 +236,11 @@ def cmd_run(args) -> int:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            ctx = _browser(p, headless=False)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _, page = connect(p)
             if not is_logged_in(page):
-                ctx.close()
                 log("ログインが切れているため反映を中止しました")
                 return 2
             rms_steps.apply(page, result["出力"], conf)
-            ctx.close()
         log("RMSへの反映が完了しました")
     except NotImplementedError as e:
         log(f"RMSへの自動反映は未対応です: {e}")
