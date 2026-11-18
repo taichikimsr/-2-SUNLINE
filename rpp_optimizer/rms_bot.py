@@ -45,10 +45,21 @@ OUT_DIR = os.path.join(BASE, "runs", "output")          # 作成したCSV・運�
 LOG_PATH = os.path.join(BASE, "runs", "bot.log")
 RECORD_PATH = os.path.join(BASE, "rms_recorded_steps.json")
 SITE_MAP_PATH = os.path.join(BASE, "rms_site_map.json")
+SITE_MAP_RPP_PATH = os.path.join(BASE, "rms_site_map_rpp.json")
 
 # RMSのURL（画面が変わった場合はここを変更）
 RMS_LOGIN_URL = "https://glogin.rms.rakuten.co.jp/"
 RMS_MAIN_URL = "https://mainmenu.rms.rakuten.co.jp/"
+# RPPの画面（2026年11月の調査で確認）
+RPP_PREFIX = "https://ad.rms.rakuten.co.jp/rpp/"
+RPP_TOP_URL = RPP_PREFIX + "top"
+RPP_URLS = {
+    "campaigns": RPP_PREFIX + "campaigns",   # キャンペーン（月予算など）
+    "items": RPP_PREFIX + "items",           # 商品・キーワード設定
+    "exclude": RPP_PREFIX + "exclude",       # 除外商品
+    "reports": RPP_PREFIX + "reports",       # パフォーマンスレポート
+    "download": RPP_PREFIX + "download",     # ダウンロード履歴
+}
 
 MAX_ACTIONS_PER_RUN = 300  # これを超える変更は自動では反映しない
 
@@ -236,8 +247,12 @@ def cmd_record(_args) -> int:
 def cmd_explore(args) -> int:
     from rms_explorer import explore
 
-    print("RMSのRPP（広告）関係の画面を自動で調べます（閲覧のみ。送信・登録・削除などは押しません）。")
+    print("RMSのRPP（広告）関係の画面を自動で調べます（閲覧のみ。送信・登録・削除・ダウンロードなどは押しません）。")
     print("Chromeが自動で画面を移動します。終わるまで操作せずにお待ちください（数分かかります）。")
+    if args.rpp:
+        # RPPの画面（キャンペーン・商品・キーワード設定・除外商品・パフォーマンスレポート）だけを詳しく調べる
+        return explore(connect, SITE_MAP_RPP_PATH, RPP_TOP_URL, max_pages=args.max_pages,
+                       prefix=RPP_PREFIX, max_depth=3)
     return explore(connect, SITE_MAP_PATH, RMS_MAIN_URL, max_pages=args.max_pages)
 
 
@@ -310,7 +325,8 @@ def main() -> int:
     sub.add_parser("check", help="ログイン状態を確認する")
     sub.add_parser("record", help="RMSでの操作を記録する")
     ex = sub.add_parser("explore", help="RMSのRPP関係の画面を自動で調べる（閲覧のみ）")
-    ex.add_argument("--max-pages", type=int, default=30)
+    ex.add_argument("--max-pages", type=int, default=40)
+    ex.add_argument("--rpp", action="store_true", help="RPPの画面だけを詳しく調べる")
     r = sub.add_parser("run", help="運用を1回実行する")
     r.add_argument("--apply", action="store_true", help="RMSへの反映まで行う")
     r.add_argument("--input", help="レポートCSVのフォルダ（指定するとダウンロードを省略）")

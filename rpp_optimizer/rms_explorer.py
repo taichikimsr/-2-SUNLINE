@@ -67,16 +67,31 @@ SNAPSHOT_JS = r"""
 """
 
 
-def _wants(text: str, href: str) -> bool:
+# 押してよいボタン（ダイアログや入力画面を「開く」だけのもの。送信・ダウンロードはしない）
+OPEN_BUTTON_WORDS = ("一括アップロード", "一括登録", "csvアップロード", "csv一括", "アップロードする画面", "編集", "詳細",
+                     "予算", "設定を変更", "キーワードを追加", "商品を追加", "除外商品を追加")
+NEVER_BUTTON_WORDS = NEVER_WORDS + ("ダウンロード", "アップロードする", "アップロード実行", "反映", "更新する", "変更する",
+                                    "追加する", "登録", "ok", "はい", "閉じる")
+
+
+def _wants(text: str, href: str, prefix: str = "", abs_url: str = "") -> bool:
     t = (text or "").lower()
     h = (href or "").lower()
     if any(w in t for w in NEVER_WORDS) or any(w in h for w in ("logout", "delete", "remove")):
         return False
+    if prefix:
+        # 調査範囲（例: RPPの画面）の中では、すべてのリンク・タブをたどる
+        return bool(abs_url) and abs_url.startswith(prefix) or (not abs_url and bool(t))
     return any(w in t for w in FOLLOW_WORDS) or "rpp" in h
 
 
+def _opens_dialog(text: str) -> bool:
+    t = (text or "").lower().replace(" ", "")
+    return any(w in t for w in OPEN_BUTTON_WORDS) and not any(w in t for w in NEVER_BUTTON_WORDS)
+
+
 def explore(connect, out_path: str, start_url: str, max_pages: int = 30, wait_ms: int = 2500,
-            allowed_host=ALLOWED_HOST) -> int:
+            allowed_host=ALLOWED_HOST, prefix: str = "", max_depth: int = 3) -> int:
     from playwright.sync_api import sync_playwright
 
     pages = []
@@ -97,7 +112,7 @@ def explore(connect, out_path: str, start_url: str, max_pages: int = 30, wait_ms
                     if target in seen_urls:
                         continue
                     page.goto(target, wait_until="domcontentloaded", timeout=60_000)
-                else:  # SPA のタブ・メニュー（href の無いもの）: 元の画面に戻ってから押す
+                else:  # SPA のタブ・メニュー、ダイアログを開くボタン: 元の画面に戻ってから押す
                     page.goto(via, wait_until="domcontentloaded", timeout=60_000)
                     page.wait_for_timeout(wait_ms)
                     page.locator(target).first.click(timeout=10_000)
@@ -118,24 +133,39 @@ def explore(connect, out_path: str, start_url: str, max_pages: int = 30, wait_ms
                 frames.append({"frame_url": fr.url, **snap})
             if url in seen_urls and kind == "goto":
                 continue
+            if prefix and kind == "goto" and not url.startswith(prefix) and len(pages) > 0:
+                continue  # 調査範囲の外に移動した
             seen_urls.add(url)
             pages.append({"url": url, "reached_by": {"kind": kind, "target": target, "from": via}, "depth": depth,
                           "frames": frames})
             title = frames[0]["title"] if frames else ""
             print(f"  調査 {len(pages):>2}: {title[:40]}  {url[:80]}")
-            if depth >= 3:
+            if kind == "button":
+                # ダイアログを開いた状態を記録したら、何も送信せずに閉じる
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            if depth >= max_depth:
                 continue
             for fr in frames:
+                if prefix and url.startswith(prefix):
+                    for b in fr["buttons"]:
+                        if _opens_dialog(b["text"]) and (url, b["css"]) not in seen_clicks and fr["frame_url"] == url:
+                            seen_clicks.add((url, b["css"]))
+                            queue.append(("button", b["css"], url, depth + 1))
                 for ln in fr["links"]:
-                    if not _wants(ln["text"], ln["href"]):
-                        continue
                     href = ln["href"]
-                    if href and not href.startswith(("javascript:", "#")):
-                        absu = urljoin(fr["frame_url"] or url, href)
+                    absu = urljoin(fr["frame_url"] or url, href) if href and not href.startswith(("javascript:", "#")) else ""
+                    if not _wants(ln["text"], href, prefix, absu):
+                        continue
+                    if absu:
                         host = urlparse(absu).hostname or ""
                         if allowed_host.search(host) and absu not in seen_urls:
                             queue.append(("goto", absu, url, depth + 1))
-                    elif ln["css"] and (url, ln["css"]) not in seen_clicks and fr["frame_url"] == url:
+                    elif ln["css"] and (url, ln["css"]) not in seen_clicks and fr["frame_url"] == url \
+                            and (not prefix or url.startswith(prefix)):
                         seen_clicks.add((url, ln["css"]))
                         queue.append(("click", ln["css"], url, depth + 1))
     with open(out_path, "w", encoding="utf-8") as f:
