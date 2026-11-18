@@ -22,6 +22,7 @@ RMSの画面操作（どのボタンを押すか）は、まだ記録できて�
       「py -m playwright install chromium」は不要）
     py rms_bot.py login     … ツール専用の普通のChromeが開くので手動でログイン（「信頼できる端末」に登録すると14日間コード不要）
     py rms_bot.py check     … ログイン状態の確認
+    py rms_bot.py probe     … お試し実行（レポートを実際に取得し、アップロードはファイル選択まで）→ rms_probe_result.json を開発側へ
     py rms_bot.py explore   … RPP関係の画面を自動で調べる（閲覧のみ）→ rms_site_map.json を開発側へ
     py rms_bot.py record    … RMSでの操作を記録（押したボタン・画面のみ。パスワード・入力文字は記録しない）
     py rms_bot.py run       … 運用を1回実行（CSVの作成まで）
@@ -256,6 +257,41 @@ def cmd_explore(args) -> int:
     return explore(connect, SITE_MAP_PATH, RMS_MAIN_URL, max_pages=args.max_pages)
 
 
+def cmd_probe(_args) -> int:
+    """お試し実行: レポートは実際にダウンロードし、一括アップロードはファイル選択まで（アップロードは押さない）"""
+    import rms_steps
+    from playwright.sync_api import sync_playwright
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    work = os.path.join(BASE, "runs", "probe", stamp)
+    os.makedirs(work, exist_ok=True)
+    # 中身は確認用（アップロードは押さないので反映されない）
+    samples = {
+        "exclude_upload": ("コントロールカラム,商品管理番号\n", "probe_exclude.csv"),
+        "item_upload": ("コントロールカラム,商品管理番号,商品CPC\n", "probe_item.csv"),
+        "keyword_upload": ("コントロールカラム,商品管理番号,キーワード,キーワードCPC\n", "probe_keyword.csv"),
+    }
+    files = {}
+    for k, (text, name) in samples.items():
+        path = os.path.join(work, name)
+        with open(path, "w", encoding="cp932", newline="") as f:
+            f.write(text)
+        files[k] = path
+    out = os.path.join(BASE, "rms_probe_result.json")
+    print("お試し実行を始めます（レポートのダウンロードは実際に行い、一括アップロードはファイル選択まで。アップロードは押しません）。")
+    print("Chromeが自動で動きます。終わるまで操作せずにお待ちください（数分かかります）。")
+    with sync_playwright() as p:
+        _, page = connect(p)
+        if not is_logged_in(page):
+            log("ログインが切れています。py rms_bot.py login でログインしてください")
+            return 2
+        res = rms_steps.probe(page, out, files, os.path.join(work, "reports"))
+    got = [s_["file"] for s_ in res["steps"] if s_.get("file")]
+    log(f"お試し実行が終わりました。取得したレポート: {got or 'なし'}")
+    print(f"{out} を送ってください（レポートの中身は含まれません）。")
+    return 0
+
+
 def cmd_run(args) -> int:
     from rpp import settings as st
     from rpp.pipeline import run_once
@@ -324,6 +360,7 @@ def main() -> int:
     sub.add_parser("login", help="手動でログインし、ログイン状態を保存する")
     sub.add_parser("check", help="ログイン状態を確認する")
     sub.add_parser("record", help="RMSでの操作を記録する")
+    sub.add_parser("probe", help="お試し実行（レポート取得は実際に行い、アップロードは押さない）")
     ex = sub.add_parser("explore", help="RMSのRPP関係の画面を自動で調べる（閲覧のみ）")
     ex.add_argument("--max-pages", type=int, default=40)
     ex.add_argument("--rpp", action="store_true", help="RPPの画面だけを詳しく調べる")
@@ -333,7 +370,7 @@ def main() -> int:
     r.add_argument("--budget", type=float, help="今回だけ月予算を変える（円）")
     args = ap.parse_args()
     return {"login": cmd_login, "check": cmd_check, "record": cmd_record, "explore": cmd_explore,
-            "run": cmd_run}[args.cmd](args)
+            "probe": cmd_probe, "run": cmd_run}[args.cmd](args)
 
 
 if __name__ == "__main__":
