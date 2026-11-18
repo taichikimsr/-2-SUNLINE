@@ -14,7 +14,7 @@
   - 1回の変更件数が上限を超えたら反映しない
 
 RMSの画面操作（どのボタンを押すか）は、まだ記録できていない。
-「record」で実際の操作を1回記録し、記録したファイルを開発側に渡すと、自動操作に組み込める。
+「record」で実際の操作を1回記録し、記録したファイル（rms_recorded_steps.json）を開発側に渡すと、自動操作に組み込める。
 
 使い方（Windows、rpp_optimizer フォルダで）:
     py -m pip install playwright
@@ -22,7 +22,7 @@ RMSの画面操作（どのボタンを押すか）は、まだ記録できて�
       「py -m playwright install chromium」は不要）
     py rms_bot.py login     … ツール専用の普通のChromeが開くので手動でログイン（「信頼できる端末」に登録すると14日間コード不要）
     py rms_bot.py check     … ログイン状態の確認
-    py rms_bot.py record    … RMSでの操作を記録（レポートのダウンロード・一括アップロード・月予算の変更）
+    py rms_bot.py record    … RMSでの操作を記録（押したボタン・画面のみ。パスワード・入力文字は記録しない）
     py rms_bot.py run       … 運用を1回実行（CSVの作成まで）
     py rms_bot.py run --apply … RMSへの反映まで実行（記録済みの操作が組み込まれてから）
 """
@@ -42,7 +42,7 @@ PROFILE_DIR = os.path.join(BASE, ".rms_profile")       # ログイン状態を�
 INBOX_DIR = os.path.join(BASE, "runs", "inbox")         # ダウンロードしたレポート
 OUT_DIR = os.path.join(BASE, "runs", "output")          # 作成したCSV・運用記録
 LOG_PATH = os.path.join(BASE, "runs", "bot.log")
-RECORD_PATH = os.path.join(BASE, "rms_recorded_steps.py")
+RECORD_PATH = os.path.join(BASE, "rms_recorded_steps.json")
 
 # RMSのURL（画面が変わった場合はここを変更）
 RMS_LOGIN_URL = "https://glogin.rms.rakuten.co.jp/"
@@ -218,26 +218,17 @@ def cmd_check(_args) -> int:
 
 
 def cmd_record(_args) -> int:
-    print("記録用のブラウザが開きます。次の操作を、普段どおり1回ずつ行ってください:")
+    from rms_recorder import record
+
+    print("ログイン用と同じ普通のChromeで、操作を記録します。")
+    print("  ※パスワードや、文字入力欄に入力した内容は記録しません（押したボタン・移動した画面・選んだファイル名のみ）")
+    print("次の操作を、普段どおり1回ずつ行ってください:")
     print("  1. RPPのパフォーマンスレポートで、キーワード別（直近30日）をCSVダウンロード")
     print("  2. 同じく商品別をCSVダウンロード")
     print("  3. 商品・キーワード設定 → 一括アップロード（キーワードCPC）でCSVを選んで送信 ※テスト用の1行のCSVで")
     print("  4. キャンペーン設定で月予算を変更する画面を開く（保存はしなくて構いません）")
-    print(f"終わったらブラウザを閉じてください。操作は {RECORD_PATH} に保存されます。")
-    print("※パスワードを入力した場合は記録に残るため、記録はログイン後の画面から始めてください。")
-    print("login で開いたChromeを終了しています …（最大30秒ほどかかります）")
-    if not close_normal_browser():
-        print("Chromeを終了できませんでした。タスクマネージャーで「Google Chrome」をすべて終了してから、もう一度実行してください。")
-        return 1
-    print("記録用のChromeを起動します。起動したら操作を始めてください。")
-    cmd = [sys.executable, "-m", "playwright", "codegen", "--target", "python",
-           "--user-data-dir", PROFILE_DIR, "-o", RECORD_PATH]
-    exe = _browser_exe().lower()
-    if "msedge" in exe or "microsoft edge" in exe:
-        cmd += ["--channel", "msedge"]
-    elif exe:
-        cmd += ["--channel", "chrome"]
-    return subprocess.call(cmd + [RMS_MAIN_URL])
+    print("ログイン画面が出た場合は、そのままログインしてください（入力内容は記録されません）。")
+    return record(connect, RECORD_PATH, RMS_MAIN_URL)
 
 
 def cmd_run(args) -> int:

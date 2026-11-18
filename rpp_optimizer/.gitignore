@@ -6,3 +6,4 @@ settings.json.tmp
 .rms_profile/
 runs/
 rms_recorded_steps.py
+rms_recorded_steps.json
