@@ -123,28 +123,54 @@ def open_normal_browser(url: str) -> None:
     raise RuntimeError("ブラウザを起動できませんでした。開いている「RMS用」のChromeウィンドウをすべて閉じてから、もう一度実行してください。")
 
 
+def _kill_profile_processes() -> None:
+    """ツール専用プロフィール（.rms_profile）で動いているChrome/Edgeだけを強制終了する（Windows）。
+    普段使いのChromeは別のプロフィールなので終了しない。"""
+    if os.name != "nt":
+        return
+    ps = ("Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') "
+          "-and $_.CommandLine -like '*.rms_profile*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+          "-ErrorAction SilentlyContinue }")
+    subprocess.call(["powershell", "-NoProfile", "-Command", ps], timeout=60)
+
+
 def close_normal_browser() -> bool:
     """ツール専用プロフィールのChromeを終了する（ウィンドウを閉じても裏で動き続けている場合があるため）"""
+    import threading
     import time
 
     if not _cdp_alive():
+        _kill_profile_processes()
+        time.sleep(1)
         return True
-    try:
-        from playwright.sync_api import sync_playwright
 
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-            try:
-                browser.new_browser_cdp_session().send("Browser.close")
-            except Exception:  # noqa: BLE001  終了の途中で接続が切れるのは正常
-                pass
-    except Exception:  # noqa: BLE001
-        pass
-    for _ in range(40):
+    def _graceful():
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}", timeout=10_000)
+                try:
+                    browser.new_browser_cdp_session().send("Browser.close")
+                except Exception:  # noqa: BLE001  終了の途中で接続が切れるのは正常
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    t = threading.Thread(target=_graceful, daemon=True)
+    t.start()
+    t.join(15)  # 15秒で応答が無ければ強制終了へ
+    for _ in range(20):
         if not _cdp_alive():
-            time.sleep(2)  # プロフィールのロック解除を待つ
-            return True
+            break
         time.sleep(0.5)
+    if _cdp_alive():
+        _kill_profile_processes()
+        time.sleep(2)
+    if not _cdp_alive():
+        _kill_profile_processes()  # 裏に残ったプロセスも念のため終了
+        time.sleep(2)  # プロフィールのロック解除を待つ
+        return True
     return False
 
 
@@ -199,11 +225,11 @@ def cmd_record(_args) -> int:
     print("  4. キャンペーン設定で月予算を変更する画面を開く（保存はしなくて構いません）")
     print(f"終わったらブラウザを閉じてください。操作は {RECORD_PATH} に保存されます。")
     print("※パスワードを入力した場合は記録に残るため、記録はログイン後の画面から始めてください。")
-    if _cdp_alive():
-        print("login で開いたChromeを終了しています …")
-        if not close_normal_browser():
-            print("Chromeを終了できませんでした。タスクマネージャーで「Google Chrome」をすべて終了してから、もう一度実行してください。")
-            return 1
+    print("login で開いたChromeを終了しています …（最大30秒ほどかかります）")
+    if not close_normal_browser():
+        print("Chromeを終了できませんでした。タスクマネージャーで「Google Chrome」をすべて終了してから、もう一度実行してください。")
+        return 1
+    print("記録用のChromeを起動します。起動したら操作を始めてください。")
     cmd = [sys.executable, "-m", "playwright", "codegen", "--target", "python",
            "--user-data-dir", PROFILE_DIR, "-o", RECORD_PATH]
     exe = _browser_exe().lower()
