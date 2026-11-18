@@ -18,7 +18,8 @@ RMSの画面操作（どのボタンを押すか）は、まだ記録できて�
 
 使い方（Windows、rpp_optimizer フォルダで）:
     py -m pip install playwright
-    py -m playwright install chromium
+    （ブラウザはPCに入っている Google Chrome または Microsoft Edge を使うため、
+      「py -m playwright install chromium」は不要）
     py rms_bot.py login     … ブラウザが開くので手動でログイン（「信頼できる端末」に登録すると14日間コード不要）
     py rms_bot.py check     … ログイン状態の確認
     py rms_bot.py record    … RMSでの操作を記録（レポートのダウンロード・一括アップロード・月予算の変更）
@@ -58,9 +59,40 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+# PCに入っているブラウザを優先して使う（Playwright専用ブラウザのダウンロードを不要にするため）
+CHANNELS = ("chrome", "msedge", None)  # None = Playwright専用のChromium（py -m playwright install chromium が必要）
+
+
 def _browser(p, headless: bool):
-    return p.chromium.launch_persistent_context(PROFILE_DIR, headless=headless, accept_downloads=True,
-                                                locale="ja-JP", viewport={"width": 1400, "height": 900})
+    last = None
+    for ch in CHANNELS:
+        try:
+            kw = {"channel": ch} if ch else {}
+            return p.chromium.launch_persistent_context(PROFILE_DIR, headless=headless, accept_downloads=True,
+                                                        locale="ja-JP", viewport={"width": 1400, "height": 900}, **kw)
+        except Exception as e:  # noqa: BLE001  そのブラウザが無ければ次を試す
+            last = e
+    raise RuntimeError("Google Chrome も Microsoft Edge も起動できませんでした。どちらかをインストールしてください。"
+                       f"（詳細: {last}）")
+
+
+def _installed_channel() -> str:
+    """codegen（操作の記録）に使うブラウザ"""
+    import shutil
+
+    candidates = {
+        "chrome": [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                   r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                   os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                   "/Applications/Google Chrome.app"],
+        "msedge": [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                   r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                   "/Applications/Microsoft Edge.app"],
+    }
+    for ch, paths in candidates.items():
+        if any(os.path.exists(x) for x in paths) or shutil.which(ch):
+            return ch
+    return ""
 
 
 def is_logged_in(page) -> bool:
@@ -105,8 +137,12 @@ def cmd_record(_args) -> int:
     print("  4. キャンペーン設定で月予算を変更する画面を開く（保存はしなくて構いません）")
     print(f"終わったらブラウザを閉じてください。操作は {RECORD_PATH} に保存されます。")
     print("※パスワードを入力した場合は記録に残るため、記録はログイン後の画面から始めてください。")
-    return subprocess.call([sys.executable, "-m", "playwright", "codegen", "--target", "python",
-                            "--user-data-dir", PROFILE_DIR, "-o", RECORD_PATH, RMS_MAIN_URL])
+    cmd = [sys.executable, "-m", "playwright", "codegen", "--target", "python",
+           "--user-data-dir", PROFILE_DIR, "-o", RECORD_PATH]
+    ch = _installed_channel()
+    if ch:
+        cmd += ["--channel", ch]
+    return subprocess.call(cmd + [RMS_MAIN_URL])
 
 
 def cmd_run(args) -> int:

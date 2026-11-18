@@ -92,8 +92,7 @@ RMSのキャンペーン設定で、月予算を同じ金額にしてくださ�
 
 ```bash
 cd rpp_optimizer
-py -m pip install playwright
-py -m playwright install chromium
+py -m pip install playwright   # ブラウザはPCの Chrome / Edge を使うので追加のダウンロードは不要
 py rms_bot.py login      # 手動でログイン（初回・ログインが切れたとき）
 py rms_bot.py record     # RMSでの操作を1回記録 → rms_recorded_steps.py を開発側へ
 py rms_bot.py run --input "レポートを置いたフォルダ"   # 今はこの形で実行
