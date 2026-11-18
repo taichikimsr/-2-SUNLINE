@@ -99,7 +99,9 @@ def record(connect, out_path: str, start_url: str) -> int:
         def watch(pg):
             pg.on("framenavigated", lambda fr: fr == pg.main_frame and add({"kind": "navigate", "url": fr.url}))
             pg.on("download", lambda d: add({"kind": "download", "url": pg.url, "file": d.suggested_filename}))
-            pg.on("filechooser", lambda fc: add({"kind": "filechooser", "url": pg.url}))
+            # 注意: page.on("filechooser") を登録すると、Playwrightがファイル選択ダイアログを横取りして
+            # 画面にダイアログが出なくなる（ファイルを選べなくなる）ため登録しない。
+            # 選んだファイル名は input[type=file] の change イベントで記録している。
             for fr in pg.frames:
                 try:
                     fr.evaluate(RECORDER_JS)
