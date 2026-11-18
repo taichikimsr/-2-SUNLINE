@@ -123,6 +123,31 @@ def open_normal_browser(url: str) -> None:
     raise RuntimeError("ブラウザを起動できませんでした。開いている「RMS用」のChromeウィンドウをすべて閉じてから、もう一度実行してください。")
 
 
+def close_normal_browser() -> bool:
+    """ツール専用プロフィールのChromeを終了する（ウィンドウを閉じても裏で動き続けている場合があるため）"""
+    import time
+
+    if not _cdp_alive():
+        return True
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+            try:
+                browser.new_browser_cdp_session().send("Browser.close")
+            except Exception:  # noqa: BLE001  終了の途中で接続が切れるのは正常
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    for _ in range(40):
+        if not _cdp_alive():
+            time.sleep(2)  # プロフィールのロック解除を待つ
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def connect(p, url: str = None):
     """専用プロフィールのChromeにつなぐ。戻り値: (context, page)"""
     open_normal_browser(url or RMS_MAIN_URL)
@@ -175,7 +200,10 @@ def cmd_record(_args) -> int:
     print(f"終わったらブラウザを閉じてください。操作は {RECORD_PATH} に保存されます。")
     print("※パスワードを入力した場合は記録に残るため、記録はログイン後の画面から始めてください。")
     if _cdp_alive():
-        input("先に、login で開いたChromeのウィンドウをすべて閉じてから Enter を押してください … ")
+        print("login で開いたChromeを終了しています …")
+        if not close_normal_browser():
+            print("Chromeを終了できませんでした。タスクマネージャーで「Google Chrome」をすべて終了してから、もう一度実行してください。")
+            return 1
     cmd = [sys.executable, "-m", "playwright", "codegen", "--target", "python",
            "--user-data-dir", PROFILE_DIR, "-o", RECORD_PATH]
     exe = _browser_exe().lower()
