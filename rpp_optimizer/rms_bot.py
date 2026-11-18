@@ -22,6 +22,7 @@ RMSの画面操作（どのボタンを押すか）は、まだ記録できて�
       「py -m playwright install chromium」は不要）
     py rms_bot.py login     … ツール専用の普通のChromeが開くので手動でログイン（「信頼できる端末」に登録すると14日間コード不要）
     py rms_bot.py check     … ログイン状態の確認
+    py rms_bot.py explore   … RPP関係の画面を自動で調べる（閲覧のみ）→ rms_site_map.json を開発側へ
     py rms_bot.py record    … RMSでの操作を記録（押したボタン・画面のみ。パスワード・入力文字は記録しない）
     py rms_bot.py run       … 運用を1回実行（CSVの作成まで）
     py rms_bot.py run --apply … RMSへの反映まで実行（記録済みの操作が組み込まれてから）
@@ -43,6 +44,7 @@ INBOX_DIR = os.path.join(BASE, "runs", "inbox")         # ダウンロードし�
 OUT_DIR = os.path.join(BASE, "runs", "output")          # 作成したCSV・運用記録
 LOG_PATH = os.path.join(BASE, "runs", "bot.log")
 RECORD_PATH = os.path.join(BASE, "rms_recorded_steps.json")
+SITE_MAP_PATH = os.path.join(BASE, "rms_site_map.json")
 
 # RMSのURL（画面が変わった場合はここを変更）
 RMS_LOGIN_URL = "https://glogin.rms.rakuten.co.jp/"
@@ -231,6 +233,14 @@ def cmd_record(_args) -> int:
     return record(connect, RECORD_PATH, RMS_MAIN_URL)
 
 
+def cmd_explore(args) -> int:
+    from rms_explorer import explore
+
+    print("RMSのRPP（広告）関係の画面を自動で調べます（閲覧のみ。送信・登録・削除などは押しません）。")
+    print("Chromeが自動で画面を移動します。終わるまで操作せずにお待ちください（数分かかります）。")
+    return explore(connect, SITE_MAP_PATH, RMS_MAIN_URL, max_pages=args.max_pages)
+
+
 def cmd_run(args) -> int:
     from rpp import settings as st
     from rpp.pipeline import run_once
@@ -299,12 +309,15 @@ def main() -> int:
     sub.add_parser("login", help="手動でログインし、ログイン状態を保存する")
     sub.add_parser("check", help="ログイン状態を確認する")
     sub.add_parser("record", help="RMSでの操作を記録する")
+    ex = sub.add_parser("explore", help="RMSのRPP関係の画面を自動で調べる（閲覧のみ）")
+    ex.add_argument("--max-pages", type=int, default=30)
     r = sub.add_parser("run", help="運用を1回実行する")
     r.add_argument("--apply", action="store_true", help="RMSへの反映まで行う")
     r.add_argument("--input", help="レポートCSVのフォルダ（指定するとダウンロードを省略）")
     r.add_argument("--budget", type=float, help="今回だけ月予算を変える（円）")
     args = ap.parse_args()
-    return {"login": cmd_login, "check": cmd_check, "record": cmd_record, "run": cmd_run}[args.cmd](args)
+    return {"login": cmd_login, "check": cmd_check, "record": cmd_record, "explore": cmd_explore,
+            "run": cmd_run}[args.cmd](args)
 
 
 if __name__ == "__main__":
